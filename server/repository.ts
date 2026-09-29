@@ -3,8 +3,14 @@ import { promisify } from "node:util";
 import { mkdir, readFile, writeFile, lstat, stat } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import type { Folder, DocumentMeta } from "../shared/types.js";
+import type {
+  Folder,
+  DocumentMeta,
+  Heading,
+  Provenance,
+} from "../shared/types.js";
 import { seedFolders, seedDocuments } from "./seed.js";
+import { frontMatter, outline } from "./markdown.js";
 const exec = promisify(execFile);
 export const hash = (text: string) =>
   createHash("sha256").update(text).digest("hex");
@@ -42,6 +48,54 @@ export function validPath(value: string, document = false) {
     throw new DomainError(400, "Documents must use a .md filename.");
   return value;
 }
+export function boundedText(
+  text: string,
+  startLine: number,
+  limit: number,
+  column: number,
+  maxChars = 24000,
+) {
+  const lines = text.split("\n");
+  if (
+    !Number.isInteger(startLine) ||
+    startLine < 1 ||
+    startLine > lines.length ||
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > 200 ||
+    !Number.isInteger(column) ||
+    column < 0 ||
+    column > lines[startLine - 1].length
+  )
+    throw new DomainError(
+      400,
+      `Use valid line ranges: start_line 1–${lines.length}, limit 1–200, and a valid column.`,
+    );
+  let output = "";
+  let line = startLine - 1;
+  let col = column;
+  const last = Math.min(lines.length, line + limit);
+  while (line < last) {
+    const part = lines[line].slice(col);
+    const room = maxChars - output.length;
+    if (part.length + 1 > room) {
+      output += part.slice(0, room);
+      col += room;
+      break;
+    }
+    output += part + (line < lines.length - 1 ? "\n" : "");
+    line++;
+    col = 0;
+  }
+  return {
+    content: output,
+    startLine,
+    endLine: Math.min(lines.length, line + (col ? 1 : 0)),
+    totalLines: lines.length,
+    nextLine: line < lines.length ? line + 1 : null,
+    nextColumn: col,
+  };
+}
 export const parentPath = (p: string) =>
   p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
 export const ancestorPaths = (p: string) => [
@@ -55,15 +109,26 @@ export interface RepositoryOptions {
   dataDir: string;
   remote?: string;
   branch?: string;
+  /** Seed the demo folders and documents into an empty repository. */
   demo: boolean;
   rootOwner: string;
+  /** Allow a service-managed bare repository when no remote is configured. */
+  localRemote?: boolean;
+  /** Root folder for an empty repository (a new workspace). */
+  root?: Partial<Folder>;
+}
+export interface StoredDocument {
+  meta: DocumentMeta;
+  content: string;
+  outline: Heading[];
+  provenance: Provenance | null;
 }
 export class Repository {
   checkout: string;
   remote: string;
   branch: string;
   folders: Folder[] = [];
-  docs = new Map<string, { meta: DocumentMeta; content: string }>();
+  docs = new Map<string, StoredDocument>();
   revision = "";
   syncedAt = "";
   syncError: string | null = null;
@@ -79,7 +144,7 @@ export class Repository {
       cwd,
       encoding: "utf8",
       maxBuffer: 40 * 1024 * 1024,
-      timeout: 30000,
+      timeout: 120000,
       env: {
         ...process.env,
         GIT_TERMINAL_PROMPT: "0",
@@ -93,7 +158,7 @@ export class Repository {
   async init() {
     await mkdir(this.options.dataDir, { recursive: true });
     if (!this.options.remote) {
-      if (!this.options.demo)
+      if (!this.options.demo && !this.options.localRemote)
         throw new Error("KNOWLEDGE_REMOTE is required outside demo mode");
       try {
         await stat(this.remote);
@@ -130,11 +195,12 @@ export class Repository {
             {
               path: "",
               name: "Knowledge",
-              ownerId: this.options.rootOwner,
-              policy: "local",
               instructions:
                 "Cite document paths, line ranges, and revisions. Human owners make final approval decisions.",
               description: "Engineering knowledge",
+              ...this.options.root,
+              ownerId: this.options.rootOwner,
+              policy: this.options.root?.policy || "local",
             },
           ];
       await mkdir(path.join(this.checkout, ".knowledge"), { recursive: true });
@@ -204,7 +270,10 @@ export class Repository {
           f.policy === "local" ||
           f.policy === "cascade"
         ) ||
-        typeof f.instructions !== "string"
+        typeof f.instructions !== "string" ||
+        (f.watchers !== undefined &&
+          (!Array.isArray(f.watchers) ||
+            f.watchers.some((w) => typeof w !== "string")))
       )
         throw new Error("Invalid folder manifest");
       paths.add(f.path);
@@ -215,8 +284,8 @@ export class Repository {
     const files = (await this.git(["ls-files", "--stage", "-z"]))
       .split("\0")
       .filter(Boolean);
-    const docs = new Map<string, { meta: DocumentMeta; content: string }>();
-
+    const docs = new Map<string, StoredDocument>();
+    const pending: StoredDocument[] = [];
     for (const file of files) {
       const [info, p] = file.split("\t");
       if (!p?.endsWith(".md") || p.startsWith(".")) continue;
@@ -227,27 +296,61 @@ export class Repository {
       if ((await stat(path.join(this.checkout, p))).size > 20 * 1024 * 1024)
         throw new Error(`Document exceeds 20 MB: ${p}`);
       const content = await this.safeRead(p);
+      const digest = hash(content);
+      const previous = this.docs.get(p);
+      if (previous?.meta.hash === digest) {
+        docs.set(p, previous);
+        continue;
+      }
+      const { data, bodyLine } = frontMatter(content);
+      const lines = content.split("\n");
       const title =
-        content.match(/^#\s+(.+)$/m)?.[1] || path.basename(p, ".md");
-      docs.set(p, {
+        data?.title ||
+        content.match(/^#\s+(.+)$/m)?.[1] ||
+        path.basename(p, ".md");
+      const doc: StoredDocument = {
         content,
+        outline: outline(content),
+        provenance: data,
         meta: {
           path: p,
           title,
           folder: parentPath(p),
           excerpt:
-            content
-              .split("\n")
-              .find((l) => l.trim() && !l.startsWith("#") && !l.startsWith(">"))
-              ?.slice(0, 180) || "",
-          lines: content.split("\n").length,
-          hash: hash(content),
-          updatedAt:
-            this.docs.get(p)?.meta.hash === hash(content)
-              ? this.docs.get(p)!.meta.updatedAt
-              : await this.git(["log", "-1", "--format=%cI", "--", p]),
+            lines
+              .slice(bodyLine - 1)
+              .find((l) => l.trim() && !/^[#>|`<-]/.test(l.trim()))
+              ?.slice(0, 160) || "",
+          lines: lines.length,
+          hash: digest,
+          updatedAt: "",
         },
-      });
+      };
+      docs.set(p, doc);
+      pending.push(doc);
+    }
+    if (pending.length) {
+      // One history pass instead of one `git log` process per document.
+      const times = new Map<string, string>();
+      const log = await this.git([
+        "log",
+        "-n",
+        "5000",
+        "--format=%x1e%cI",
+        "--name-only",
+        "-z",
+      ]);
+      // Format per commit: \x1e<date>\0\n<path>\0<path>\0…
+      for (const entry of log.split("\x1e").filter(Boolean)) {
+        const [head, ...names] = entry.split("\0");
+        for (const name of names) {
+          const n = name.replace(/^\n/, "");
+          if (n && !times.has(n)) times.set(n, head.trim());
+        }
+      }
+      const fallback = await this.git(["log", "-1", "--format=%cI"]);
+      for (const doc of pending)
+        doc.meta.updatedAt = times.get(doc.meta.path) || fallback;
     }
     this.folders = folders;
     this.docs = docs;
@@ -263,7 +366,9 @@ export class Repository {
         });
         await writeFile(path.join(this.checkout, p), content);
       }
-      await this.git(["add", "--", ...Object.keys(files)]);
+      const names = Object.keys(files);
+      for (let i = 0; i < names.length; i += 200)
+        await this.git(["add", "--", ...names.slice(i, i + 200)]);
       if (!(await this.git(["diff", "--cached", "--name-only"])))
         return this.revision;
       await this.git(["commit", "-m", message]);

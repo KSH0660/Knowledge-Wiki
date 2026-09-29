@@ -22,6 +22,8 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
+  Bell,
+  CircleX,
   SquarePen,
   X,
 } from "lucide-react";
@@ -32,9 +34,10 @@ import type {
   PersonalSettings,
   ProposedFile,
 } from "../shared/types";
-import { api, enc, relativeTime } from "./api";
+import { api, enc, portalApi, relativeTime } from "./api";
 import {
-  AIButton,
+  PromptButton,
+  usePromptContext,
   Avatar,
   Badge,
   Breadcrumb,
@@ -58,7 +61,7 @@ function ChangeTable({
   changes: CRSummary[];
   review?: boolean;
 }) {
-  const { data } = useApp();
+  const { data, base } = useApp();
   return changes.length ? (
     <div className="table-scroll">
       <table className="data-table change-table">
@@ -85,7 +88,10 @@ function ChangeTable({
             return (
               <tr key={c.id}>
                 <td>
-                  <Link className="change-title-cell" to={"/changes/" + c.id}>
+                  <Link
+                    className="change-title-cell"
+                    to={base + "/changes/" + c.id}
+                  >
                     <span className="cr-reference">
                       CR-{String(c.id).padStart(3, "0")}
                     </span>
@@ -126,7 +132,7 @@ function ChangeTable({
                   <Link
                     className="icon-button"
                     aria-label={"Open CR-" + c.id}
-                    to={"/changes/" + c.id}
+                    to={base + "/changes/" + c.id}
                   >
                     <ChevronRight size={15} />
                   </Link>
@@ -159,7 +165,7 @@ function FolderIcon() {
   );
 }
 export function ChangesPage() {
-  const { data } = useApp();
+  const { data, base } = useApp();
   const [params, setParams] = useSearchParams();
   const filter = params.get("filter") || "all";
   const [query, setQuery] = useState("");
@@ -178,7 +184,7 @@ export function ChangesPage() {
         title="Change requests"
         description="Thoughtful proposals. Clear reviews. Better shared knowledge."
         actions={
-          <Link className="button primary" to="/changes/new">
+          <Link className="button primary" to={base + "/changes/new"}>
             <Plus size={16} />
             New change request
           </Link>
@@ -192,6 +198,7 @@ export function ChangesPage() {
             ["in_review", "In review"],
             ["published", "Published"],
             ["draft", "Drafts"],
+            ["rejected", "Rejected"],
           ].map(([k, label]) => (
             <button
               key={k}
@@ -227,13 +234,15 @@ export function ChangesPage() {
   );
 }
 export function ReviewsPage() {
-  const { data, openPrompt } = useApp();
-  const [tab, setTab] = useState("pending");
+  const { data, base } = useApp();
+  const [params, setParams] = useSearchParams();
+  const tab = params.get("tab") || "pending";
+  const setTab = (t: string) => setParams(t === "pending" ? {} : { tab: t });
   const [area, setArea] = useState("");
   const [sort, setSort] = useState("oldest");
   const [settings, setSettings] = useState<PersonalSettings | null>(null);
   useEffect(() => {
-    api<PersonalSettings>("/settings")
+    portalApi<PersonalSettings>("/settings")
       .then(setSettings)
       .catch(() => {});
   }, []);
@@ -248,14 +257,19 @@ export function ReviewsPage() {
           r.decision === "approve",
       ),
   );
+  const fyi = data.changes.filter(
+    (c) => c.status === "in_review" && c.fyiIds.includes(data.user.id),
+  );
   const source =
     tab === "pending"
       ? pending
-      : tab === "reviewed"
-        ? data.changes.filter((c) =>
-            c.reviews.some((r) => r.userId === data.user.id),
-          )
-        : data.changes.filter((c) => c.approverIds.includes(data.user.id));
+      : tab === "fyi"
+        ? fyi
+        : tab === "reviewed"
+          ? data.changes.filter((c) =>
+              c.reviews.some((r) => r.userId === data.user.id),
+            )
+          : data.changes.filter((c) => c.approverIds.includes(data.user.id));
   const filtered = source
     .filter((c) => !area || c.files.some((f) => fileFolder(f.path) === area))
     .sort((a, b) =>
@@ -270,11 +284,12 @@ export function ReviewsPage() {
         title="My reviews"
         description="Changes that need your perspective, based on the areas you own."
         actions={
-          <AIButton
-            label="Prepare a review prompt"
-            task="review"
-            onClick={() =>
-              openPrompt({ task: "review", changeId: pending[0]?.id })
+          <PromptButton
+            primary
+            label={
+              pending.length
+                ? `Copy review prompt · CR-${pending[0].id}`
+                : "Copy prompt"
             }
           />
         }
@@ -300,7 +315,8 @@ export function ReviewsPage() {
       <Panel>
         <div className="tabs toolbar-tabs">
           {[
-            ["pending", "Needs my review"],
+            ["pending", "Needs my approval"],
+            ["fyi", "FYI"],
             ["reviewed", "Reviewed by me"],
             ["all", "All assigned"],
           ].map(([k, v]) => (
@@ -311,6 +327,7 @@ export function ReviewsPage() {
             >
               {v}
               {k === "pending" && <span>{pending.length}</span>}
+              {k === "fyi" && <span>{fyi.length}</span>}
             </button>
           ))}
         </div>
@@ -344,7 +361,7 @@ export function ReviewsPage() {
         <Panel
           title="Your review preferences"
           action={
-            <Link to="/settings" className="text-link">
+            <Link to={base + "/settings"} className="text-link">
               Edit preferences <ArrowUpRight size={13} />
             </Link>
           }
@@ -433,7 +450,7 @@ export function DiffView({
   );
 }
 export function CreateChangePage() {
-  const { data, refresh, notify, openPrompt } = useApp();
+  const { data, base, refresh, notify } = useApp();
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const editId = params.get("edit");
@@ -541,18 +558,32 @@ export function CreateChangePage() {
       ),
     );
   }
-  const folder = data.folders.find((f) => f.path === fileFolder(currentPath));
+  // New subfolders are created on publish; until then the nearest existing folder governs.
+  const scopeOf = (p: string) => {
+    let dir = fileFolder(p);
+    for (;;) {
+      const f = data.folders.find((x) => x.path === dir);
+      if (f || !dir) return f;
+      dir = fileFolder(dir);
+    }
+  };
+  const folder = scopeOf(currentPath);
   const approvers = [
-    ...new Set(
-      files.flatMap((f) => {
-        const p = f.path;
-        return (
-          data.folders.find((folder) => folder.path === fileFolder(p))
-            ?.approverIds || []
-        );
-      }),
-    ),
+    ...new Set(files.flatMap((f) => scopeOf(f.path)?.approverIds || [])),
   ];
+  const fyi = [
+    ...new Set(files.flatMap((f) => scopeOf(f.path)?.fyiIds || [])),
+  ].filter((id) => !approvers.includes(id) && id !== data.user.id);
+  usePromptContext({
+    screen: "compose",
+    folder: newDoc
+      ? newFolder
+      : current
+        ? fileFolder(current.path)
+        : params.get("folder") || "",
+    document: current?.baseHash ? current.path : undefined,
+    changeId: editId ? Number(editId) : undefined,
+  });
   async function submit(draft: boolean) {
     setError("");
     if (!title.trim() || !rationale.trim()) {
@@ -598,7 +629,7 @@ export function CreateChangePage() {
           ? "Draft saved. You can return to it anytime."
           : "Change request submitted to the responsible owners.",
       );
-      navigate("/changes/" + cr.id);
+      navigate(base + "/changes/" + cr.id);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -859,7 +890,7 @@ export function CreateChangePage() {
           <div className="form-actions">
             <Link
               className="button"
-              to={editId ? "/changes/" + editId : "/changes"}
+              to={base + (editId ? "/changes/" + editId : "/changes")}
             >
               Cancel
             </Link>
@@ -910,6 +941,12 @@ export function CreateChangePage() {
                     <Badge tone="amber">Required</Badge>
                   </div>
                 ))}
+                {fyi.map((id) => (
+                  <div key={id}>
+                    <Person id={id} subtitle="Informed, not required" />
+                    <Badge tone="gray">FYI</Badge>
+                  </div>
+                ))}
                 {!approvers.length && (
                   <p className="muted small">
                     Select a document to see its approval route.
@@ -934,24 +971,10 @@ export function CreateChangePage() {
           >
             <div className="panel-body">
               <p className="muted small">
-                Build a drafting prompt with the folder’s instructions and your
-                current context.
+                One click copies a drafting prompt with the folder’s
+                instructions and what you are editing.
               </p>
-              <AIButton
-                label="Build a draft prompt"
-                onClick={() =>
-                  openPrompt({
-                    task: "draft",
-                    folder: newDoc
-                      ? newFolder
-                      : current
-                        ? fileFolder(current.path)
-                        : "",
-                    document: current?.baseHash ? current.path : undefined,
-                    changeId: editId ? Number(editId) : undefined,
-                  })
-                }
-              />
+              <PromptButton label="Copy draft prompt" />
               <p className="fine-print">
                 Copy the prompt into your coding agent. Your document stays in
                 your workspace.
@@ -972,14 +995,14 @@ export function CreateChangePage() {
 }
 export function ChangeDetailPage() {
   const { id } = useParams();
-  const { data, refresh, notify, openPrompt } = useApp();
+  const { data, base, refresh, notify } = useApp();
   const [cr, setCr] = useState<ChangeRequest | null>(null);
   const [error, setError] = useState("");
   const [tab, setTab] = useState("changes");
   const [comment, setComment] = useState("");
   const [busy, setBusy] = useState(false);
   const [decision, setDecision] = useState<
-    "approve" | "request_changes" | null
+    "approve" | "request_changes" | "reject" | null
   >(null);
   const [reviewComment, setReviewComment] = useState("");
   useEffect(() => {
@@ -1037,7 +1060,9 @@ export function ChangeDetailPage() {
           ? "Approved and published. The knowledge is now up to date."
           : decision === "approve"
             ? "Your approval has been recorded."
-            : "Changes requested. Your feedback is ready for the author.",
+            : decision === "reject"
+              ? "Change rejected. Nothing was written to the repository."
+              : "Changes requested. Your feedback is ready for the author.",
       );
     } catch (e) {
       setError((e as Error).message);
@@ -1048,7 +1073,7 @@ export function ChangeDetailPage() {
   return (
     <div className="page cr-detail-page">
       <div className="breadcrumb">
-        <Link to="/changes">Change requests</Link>
+        <Link to={base + "/changes"}>Change requests</Link>
         <ChevronRight size={12} />
         <span>CR-{String(cr.id).padStart(3, "0")}</span>
       </div>
@@ -1066,14 +1091,28 @@ export function ChangeDetailPage() {
         }
         actions={
           <>
-            {cr.authorId === data.user.id && cr.status !== "published" && (
-              <Link className="button" to={"/changes/new?edit=" + cr.id}>
-                <SquarePen size={15} />
-                Edit proposal
-              </Link>
-            )}
+            {cr.authorId === data.user.id &&
+              cr.status !== "published" &&
+              cr.status !== "rejected" && (
+                <Link
+                  className="button"
+                  to={base + "/changes/new?edit=" + cr.id}
+                >
+                  <SquarePen size={15} />
+                  Edit proposal
+                </Link>
+              )}
             {canReview && (
               <>
+                <button
+                  className="button"
+                  onClick={() => {
+                    setDecision("reject");
+                    setError("");
+                  }}
+                >
+                  Reject
+                </button>
                 <button
                   className="button"
                   onClick={() => {
@@ -1106,9 +1145,23 @@ export function ChangeDetailPage() {
             <strong>Approved and published</strong>
             <p>This change is now part of your team’s shared knowledge.</p>
           </div>
-          <Link to={"/documents?path=" + enc(cr.files[0].path)}>
+          <Link to={base + "/documents?path=" + enc(cr.files[0].path)}>
             View document <ArrowUpRight size={14} />
           </Link>
+        </div>
+      )}
+      {cr.status === "rejected" && (
+        <div className="callout rejected-callout">
+          <CircleX size={18} />
+          <p>
+            Rejected by{" "}
+            {data.users.find(
+              (u) =>
+                u.id ===
+                cr.reviews.find((r) => r.decision === "reject")?.userId,
+            )?.name || "a required owner"}
+            . Nothing from this proposal was written to the repository.
+          </p>
         </div>
       )}
       {cr.status === "changes_requested" && (
@@ -1245,7 +1298,9 @@ export function ChangeDetailPage() {
                         {data.users.find((u) => u.id === r.userId)?.name}{" "}
                         {r.decision === "approve"
                           ? "approved"
-                          : "requested changes"}
+                          : r.decision === "reject"
+                            ? "rejected"
+                            : "requested changes"}
                       </strong>
                       <p>
                         {new Date(r.at).toLocaleString()} · Proposal v
@@ -1324,14 +1379,18 @@ export function ChangeDetailPage() {
                           ? "green"
                           : review?.decision === "request_changes"
                             ? "amber"
-                            : "gray"
+                            : review?.decision === "reject"
+                              ? "red"
+                              : "gray"
                       }
                     >
                       {review?.decision === "approve"
                         ? "Approved"
                         : review?.decision === "request_changes"
                           ? "Changes needed"
-                          : "Pending"}
+                          : review?.decision === "reject"
+                            ? "Rejected"
+                            : "Pending"}
                     </Badge>
                   </div>
                 );
@@ -1341,6 +1400,37 @@ export function ChangeDetailPage() {
               </p>
             </div>
           </Panel>
+          {cr.fyiIds.length > 0 && (
+            <Panel
+              title={
+                <>
+                  <Bell size={15} />
+                  Informed (FYI)
+                </>
+              }
+              action={<span className="small muted">not required</span>}
+            >
+              <div className="panel-body approver-list">
+                {cr.fyiIds.map((uid) => (
+                  <div key={uid}>
+                    <Person
+                      id={uid}
+                      subtitle={
+                        uid === data.user.id
+                          ? "You · notified only"
+                          : "Notified only"
+                      }
+                    />
+                    <Badge tone="gray">FYI</Badge>
+                  </div>
+                ))}
+                <p className="fine-print">
+                  Ancestor owners under Local approval and folder watchers are
+                  informed. Their approval is never required.
+                </p>
+              </div>
+            </Panel>
+          )}
           <Panel
             title={
               <>
@@ -1353,9 +1443,8 @@ export function ChangeDetailPage() {
                 Investigate the evidence and possible effects with your agent
                 before making a decision.
               </p>
-              <AIButton
-                label="Build a review prompt"
-                onClick={() => openPrompt({ task: "review", changeId: cr.id })}
+              <PromptButton
+                label={canReview ? "Copy review prompt" : "Copy prompt"}
               />
               <p className="fine-print">
                 Includes this proposal, folder instructions, and your personal
@@ -1395,12 +1484,16 @@ export function ChangeDetailPage() {
           title={
             decision === "approve"
               ? "Approve this change?"
-              : "Request an update"
+              : decision === "reject"
+                ? "Reject this change?"
+                : "Request an update"
           }
           description={
             decision === "approve"
               ? "Your review is part of what makes this knowledge dependable."
-              : "Give the author clear, actionable feedback."
+              : decision === "reject"
+                ? "Rejected proposals are closed and never written to the repository."
+                : "Give the author clear, actionable feedback."
           }
           onClose={() => {
             if (!busy) setDecision(null);
@@ -1411,8 +1504,10 @@ export function ChangeDetailPage() {
               <ShieldCheck size={18} />
               <p>
                 {decision === "approve"
-                  ? "After all required owners approve, this proposal is published automatically."
-                  : "The author will need to update and resubmit the proposal. Previous approvals will be cleared."}
+                  ? "After all required owners approve, Knowledge Wiki writes the files and records one commit."
+                  : decision === "reject"
+                    ? "The author cannot revise a rejected change; a new proposal is needed."
+                    : "The author will need to update and resubmit the proposal. Previous approvals will be cleared."}
               </p>
             </div>
             <label>
@@ -1428,7 +1523,9 @@ export function ChangeDetailPage() {
                 placeholder={
                   decision === "approve"
                     ? "Anything useful to record about your review?"
-                    : "What needs to change, and why?"
+                    : decision === "reject"
+                      ? "Why is this change rejected?"
+                      : "What needs to change, and why?"
                 }
               />
             </label>
@@ -1447,8 +1544,7 @@ export function ChangeDetailPage() {
                 "button " + (decision === "approve" ? "success" : "primary")
               }
               disabled={
-                busy ||
-                (decision === "request_changes" && !reviewComment.trim())
+                busy || (decision !== "approve" && !reviewComment.trim())
               }
               onClick={review}
             >
@@ -1456,7 +1552,9 @@ export function ChangeDetailPage() {
                 ? "Saving…"
                 : decision === "approve"
                   ? "Confirm approval"
-                  : "Send feedback"}
+                  : decision === "reject"
+                    ? "Reject change"
+                    : "Send feedback"}
             </button>
           </div>
         </Modal>

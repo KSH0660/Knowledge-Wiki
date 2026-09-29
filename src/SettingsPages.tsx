@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   ArrowDown,
-  ArrowUpRight,
   Check,
   ChevronRight,
   CircleHelp,
@@ -16,10 +15,10 @@ import {
   UserRound,
 } from "lucide-react";
 import type { PersonalSettings, Policy, Task } from "../shared/types";
-import { taskLabels } from "../shared/types";
-import { api, enc } from "./api";
+import { taskDescriptions, taskLabels, tasks } from "../shared/types";
+import { api, enc, portalApi } from "./api";
 import {
-  AIButton,
+  PromptButton,
   Badge,
   Breadcrumb,
   Empty,
@@ -32,7 +31,7 @@ import {
   useApp,
 } from "./ui";
 export function GovernancePage() {
-  const { data, refresh, notify, openPrompt } = useApp();
+  const { data, base, refresh, notify } = useApp();
   const [params, setParams] = useSearchParams();
   const p = params.get("folder") || "";
   const folder = data.folders.find((f) => f.path === p);
@@ -40,6 +39,7 @@ export function GovernancePage() {
   const [policy, setPolicy] = useState("");
   const [instructions, setInstructions] = useState("");
   const [description, setDescription] = useState("");
+  const [watchers, setWatchers] = useState<string[]>([]);
   const [revision, setRevision] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -50,6 +50,7 @@ export function GovernancePage() {
       setPolicy(folder.policy || "");
       setInstructions(folder.instructions);
       setDescription(folder.description);
+      setWatchers(folder.watchers || []);
       setRevision(data.revision);
       setError("");
       setDirty(false);
@@ -60,7 +61,7 @@ export function GovernancePage() {
       <div className="page">
         <Empty
           title="Folder not found"
-          action={<Link to="/governance">Back to governance</Link>}
+          action={<Link to={base + "/governance"}>Back to governance</Link>}
         />
       </div>
     );
@@ -81,6 +82,7 @@ export function GovernancePage() {
           policy: policy || null,
           instructions,
           description,
+          watchers,
           revision,
         }),
       });
@@ -104,14 +106,17 @@ export function GovernancePage() {
         title="Folder governance"
         description="Give knowledge an owner, a review policy, and the right guidance for AI."
         actions={
-          <button
-            className="button primary"
-            disabled={!canEdit || !dirty || busy}
-            onClick={save}
-          >
-            <Save size={15} />
-            {busy ? "Saving…" : "Save changes"}
-          </button>
+          <>
+            <PromptButton label="Copy governance prompt" />
+            <button
+              className="button primary"
+              disabled={!canEdit || !dirty || busy}
+              onClick={save}
+            >
+              <Save size={15} />
+              {busy ? "Saving…" : "Save changes"}
+            </button>
+          </>
         }
       />
       <div className="governance-layout">
@@ -125,6 +130,7 @@ export function GovernancePage() {
           }
         >
           <FolderTree
+            rootLabel={data.workspace.name}
             folders={data.folders}
             value={p}
             onChange={(path) => {
@@ -148,7 +154,9 @@ export function GovernancePage() {
               <FolderClosed size={22} />
             </span>
             <div>
-              <h2>{folder.name}</h2>
+              <h2>
+                {p ? folder.name : `${data.workspace.name} (workspace root)`}
+              </h2>
               <p>
                 {p || "Knowledge root"} <span>·</span> {folder.documentCount}{" "}
                 documents in this area
@@ -222,6 +230,65 @@ export function GovernancePage() {
                     responsible for {folder.name} and its descendants, until a
                     subfolder assigns a different owner.
                   </p>
+                </div>
+                <div>
+                  <span className="field-label">
+                    Also inform (FYI){" "}
+                    <span className="optional">
+                      Notified about changes · never required
+                    </span>
+                  </span>
+                  <div className="chip-group">
+                    {data.users.map((u) => (
+                      <button
+                        type="button"
+                        key={u.id}
+                        className={
+                          "chip " + (watchers.includes(u.id) ? "active" : "")
+                        }
+                        onClick={() => {
+                          setWatchers((w) =>
+                            w.includes(u.id)
+                              ? w.filter((x) => x !== u.id)
+                              : [...w, u.id],
+                          );
+                          setDirty(true);
+                        }}
+                      >
+                        {watchers.includes(u.id) && <Check size={11} />}{" "}
+                        {u.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="route-summary">
+                  <div>
+                    <span className="section-label">REQUIRED APPROVAL</span>
+                    <p>
+                      {folder.approverIds
+                        .map(
+                          (id) =>
+                            data.users.find((u) => u.id === id)?.name || id,
+                        )
+                        .join(", ")}
+                    </p>
+                  </div>
+                  <div>
+                    <span className="section-label">FYI · INFORMED ONLY</span>
+                    <p>
+                      {folder.fyiIds.length
+                        ? folder.fyiIds
+                            .map(
+                              (id) =>
+                                data.users.find((u) => u.id === id)?.name || id,
+                            )
+                            .join(", ")
+                        : "Nobody"}
+                    </p>
+                  </div>
+                  {dirty && (
+                    <small>Saved route shown; it updates after you save.</small>
+                  )}
                 </div>
                 <label>
                   Area description
@@ -372,22 +439,44 @@ export function GovernancePage() {
   );
 }
 export function SettingsPage() {
-  const { notify, openPrompt } = useApp();
+  const { data, notify } = useApp();
   const [settings, setSettings] = useState<PersonalSettings | null>(null);
   const [task, setTask] = useState<Task>("review");
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [portal, setPortal] = useState<{
+    text: string;
+    isDefault: boolean;
+    defaultText: string;
+  } | null>(null);
+  const [portalText, setPortalText] = useState("");
+  const admin = !!data.user.admin;
   useEffect(() => {
-    api<PersonalSettings>("/settings")
+    portalApi<PersonalSettings>("/settings")
       .then(setSettings)
       .catch((e) => setError(e.message));
+    portalApi<{ text: string; isDefault: boolean; defaultText: string }>(
+      "/portal",
+    )
+      .then((p) => {
+        setPortal(p);
+        setPortalText(p.text);
+      })
+      .catch(() => {});
   }, []);
   async function save() {
     setBusy(true);
     try {
-      await api("/settings", { method: "PUT", body: JSON.stringify(settings) });
-      notify("Your AI preferences have been saved.");
+      setSettings(
+        await portalApi<PersonalSettings>("/settings", {
+          method: "PUT",
+          body: JSON.stringify(settings),
+        }),
+      );
+      notify(
+        "Your AI preferences have been saved. They apply to every Copy prompt.",
+      );
       setDirty(false);
       setError("");
     } catch (e) {
@@ -396,21 +485,48 @@ export function SettingsPage() {
       setBusy(false);
     }
   }
+  async function savePortal(text: string | null) {
+    try {
+      const next = await portalApi<{
+        text: string;
+        isDefault: boolean;
+        defaultText: string;
+      }>("/portal", {
+        method: "PUT",
+        body: JSON.stringify({ text }),
+      });
+      setPortal(next);
+      setPortalText(next.text);
+      notify("Portal-wide AI instructions saved for every workspace.");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  const update = (patch: Partial<PersonalSettings>) => {
+    setSettings({ ...settings!, ...patch });
+    setDirty(true);
+  };
   return (
     <div className="page settings-page">
       <PageHeading
-        eyebrow="MAKE THE CONTEXT YOURS"
-        title="Personal AI settings"
-        description="Tell your agent how you like to work. Your preferences travel with every prompt."
+        eyebrow="OPTIONAL · COPY PROMPT WORKS WITHOUT ANY OF THIS"
+        title="AI prompt settings"
+        description="Add your own preferences to every prompt you copy. Leave them empty and you still get a complete prompt."
         actions={
-          <button
-            className="button primary"
-            disabled={!dirty || busy}
-            onClick={save}
-          >
-            <Save size={15} />
-            {busy ? "Saving…" : "Save preferences"}
-          </button>
+          <>
+            <PromptButton
+              label={`Preview · ${taskLabels[task]}`}
+              context={{ screen: "settings", task }}
+            />
+            <button
+              className="button primary"
+              disabled={!dirty || busy}
+              onClick={save}
+            >
+              <Save size={15} />
+              {busy ? "Saving…" : "Save preferences"}
+            </button>
+          </>
         }
       />
       <ErrorMessage error={error} />
@@ -419,47 +535,39 @@ export function SettingsPage() {
       ) : (
         <div className="settings-layout">
           <div className="form-stack">
-            <Panel title="Your default task">
-              <div className="panel-body">
-                <p className="muted small">
-                  The starting point when you open AI Prompt. A change request
-                  opens in review mode automatically.
-                </p>
-                <label className="narrow-field">
-                  Default prompt task
-                  <select
-                    value={settings.defaultTask}
-                    onChange={(e) => {
-                      setSettings({
-                        ...settings,
-                        defaultTask: e.target.value as Task,
-                      });
-                      setDirty(true);
-                    }}
-                  >
-                    {Object.entries(taskLabels).map(([k, v]) => (
-                      <option key={k} value={k}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-            </Panel>
             <Panel
-              title="Task-specific preferences"
+              title="For every task"
               action={<Badge tone="purple">Just for you</Badge>}
             >
+              <div className="panel-body">
+                <label>
+                  Global preferences
+                  <textarea
+                    aria-label="Global personal instructions"
+                    rows={3}
+                    maxLength={4000}
+                    value={settings.global}
+                    placeholder="e.g. Answer in Korean, keep English spec terms. Put a summary table first."
+                    onChange={(e) => update({ global: e.target.value })}
+                  />
+                </label>
+                <div className="field-meta">
+                  <span>Added to every prompt, after the task template.</span>
+                  <span>{settings.global.length} / 4,000</span>
+                </div>
+              </div>
+            </Panel>
+            <Panel title="Task-specific preferences">
               <div className="personal-task-layout">
                 <nav aria-label="Prompt task settings">
-                  {Object.entries(taskLabels).map(([key, label]) => (
+                  {tasks.map((key) => (
                     <button
                       key={key}
-                      onClick={() => setTask(key as Task)}
+                      onClick={() => setTask(key)}
                       className={task === key ? "active" : ""}
                     >
-                      <span>{label}</span>
-                      {settings.customizations[key as Task] && (
+                      <span>{taskLabels[key]}</span>
+                      {settings.customizations[key] && (
                         <span className="preference-dot" />
                       )}
                       <ChevronRight size={13} />
@@ -472,31 +580,29 @@ export function SettingsPage() {
                   </span>
                   <h3>{taskLabels[task]}</h3>
                   <p>
-                    What should your agent pay particular attention to for this
-                    task?
+                    {taskDescriptions[task]}. What should your agent pay
+                    particular attention to?
                   </p>
                   <label>
                     Your instructions
                     <textarea
                       aria-label="Personal task instructions"
-                      rows={9}
+                      rows={8}
                       maxLength={4000}
                       value={settings.customizations[task]}
-                      onChange={(e) => {
-                        setSettings({
-                          ...settings,
+                      onChange={(e) =>
+                        update({
                           customizations: {
                             ...settings.customizations,
                             [task]: e.target.value,
                           },
-                        });
-                        setDirty(true);
-                      }}
+                        })
+                      }
                       placeholder="e.g. Start with a short summary. Prioritize evidence and backward compatibility. End with open questions."
                     />
                   </label>
                   <div className="field-meta">
-                    <span>Appended after the shared task template.</span>
+                    <span>Added after your global preferences.</span>
                     <span>{settings.customizations[task].length} / 4,000</span>
                   </div>
                 </div>
@@ -521,7 +627,7 @@ export function SettingsPage() {
               title={
                 <>
                   <Layers3 size={16} />
-                  How your prompt comes together
+                  How every prompt is built
                 </>
               }
             >
@@ -529,24 +635,28 @@ export function SettingsPage() {
                 {[
                   {
                     name: "Portal guidelines",
-                    detail: "How to use knowledge and MCP",
+                    detail: "MCP usage rules for all workspaces",
                   },
                   {
-                    name: "Folder instructions",
-                    detail: "Context from the full folder path",
+                    name: "Workspace & folder instructions",
+                    detail: "Inherited down to the current folder",
                   },
                   {
-                    name: "Task template",
-                    detail: "A starting point for the work",
+                    name: "Task",
+                    detail: "Chosen automatically for the page and your role",
                   },
                   {
                     name: "Your preferences",
-                    detail: "Your way of thinking and reviewing",
+                    detail: "Global, then task-specific",
                     active: true,
                   },
                   {
                     name: "Current context",
-                    detail: "The document or change in view",
+                    detail: "Workspace, folder, document, CR, owners",
+                  },
+                  {
+                    name: "One-off instruction",
+                    detail: "Only when you customize a copy",
                   },
                 ].map((s, i) => (
                   <div className={s.active ? "active" : ""} key={s.name}>
@@ -560,20 +670,54 @@ export function SettingsPage() {
                 ))}
               </div>
             </Panel>
-            <div className="settings-tip">
-              <Sparkles size={21} />
-              <h3>Specific beats long.</h3>
-              <p>
-                A few clear instructions work better than a long checklist.
-                Think about what you always look for in a good review.
-              </p>
-              <button
-                className="text-link"
-                onClick={() => openPrompt({ task })}
+            {portal && (
+              <Panel
+                title={
+                  <>
+                    <Settings2 size={15} />
+                    Portal-wide AI instructions
+                  </>
+                }
+                action={
+                  <Badge tone={portal.isDefault ? "gray" : "blue"}>
+                    {portal.isDefault ? "Default" : "Customized"}
+                  </Badge>
+                }
               >
-                Preview a saved prompt <ArrowUpRight size={14} />
-              </button>
-            </div>
+                <div className="panel-body form-stack">
+                  <textarea
+                    aria-label="Portal-wide AI instructions"
+                    rows={8}
+                    readOnly={!admin}
+                    value={portalText}
+                    onChange={(e) => setPortalText(e.target.value)}
+                  />
+                  {admin ? (
+                    <div className="inline-actions">
+                      <button
+                        className="button"
+                        disabled={portal.isDefault}
+                        onClick={() => savePortal(null)}
+                      >
+                        Reset to default
+                      </button>
+                      <button
+                        className="button primary"
+                        disabled={portalText === portal.text}
+                        onClick={() => savePortal(portalText)}
+                      >
+                        Save for all workspaces
+                      </button>
+                    </div>
+                  ) : (
+                    <p className="fine-print">
+                      Maintained by portal administrators. First layer of every
+                      prompt.
+                    </p>
+                  )}
+                </div>
+              </Panel>
+            )}
           </aside>
         </div>
       )}
