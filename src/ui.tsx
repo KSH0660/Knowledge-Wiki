@@ -13,13 +13,16 @@ import {
   LoaderCircle,
   Inbox,
   CircleCheck,
+  CircleX,
   Clock3,
   FilePenLine,
   MessageSquareMore,
   ArrowUpRight,
-  Sparkles,
   Folder,
   ChevronDown,
+  Check,
+  Copy,
+  SlidersHorizontal,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -29,14 +32,34 @@ import type {
   PromptInput,
   ResolvedFolder,
   User,
+  WorkspaceSummary,
 } from "../shared/types";
-export const AppContext = createContext<{
+import { stripFrontMatter } from "./api";
+export interface AppContextValue {
   data: Catalog;
+  /** Route prefix of the current workspace, e.g. /w/acpi */
+  base: string;
+  workspaces: WorkspaceSummary[];
   refresh: () => Promise<void>;
+  refreshWorkspaces: () => Promise<void>;
   notify: (s: string) => void;
+  /** Secondary: open the customization drawer. */
   openPrompt: (p?: Partial<PromptInput>) => void;
-}>(null!);
+  /** Primary: copy the best Markdown prompt for this context in one click. */
+  copyPrompt: (p?: Partial<PromptInput>) => Promise<void>;
+  setPromptContext: (p: Partial<PromptInput> | null) => void;
+}
+export const AppContext = createContext<AppContextValue>(null!);
 export const useApp = () => useContext(AppContext);
+/** Let a page refine what the global Copy prompt button describes. */
+export function usePromptContext(context: Partial<PromptInput> | null) {
+  const { setPromptContext } = useApp();
+  const key = JSON.stringify(context);
+  useEffect(() => {
+    setPromptContext(context);
+  }, [key]);
+  useEffect(() => () => setPromptContext(null), []);
+}
 export function IconButton({
   label,
   children,
@@ -99,6 +122,7 @@ const statuses: Record<
     class: "amber",
     icon: MessageSquareMore,
   },
+  rejected: { label: "Rejected", class: "red", icon: CircleX },
   published: { label: "Published", class: "green", icon: CircleCheck },
 };
 export function Status({ status }: { status: CRStatus }) {
@@ -205,17 +229,17 @@ export function Breadcrumb({
   folder?: string;
   tail?: string;
 }) {
-  const { data } = useApp();
+  const { data, base } = useApp();
   const parts = (folder || "").split("/").filter(Boolean);
   return (
     <div className="breadcrumb">
-      <Link to="/knowledge">Knowledge</Link>
+      <Link to={base + "/knowledge"}>{data.workspace.name}</Link>
       {parts.map((_, i) => {
         const p = parts.slice(0, i + 1).join("/");
         return (
           <span key={p}>
             <ChevronRight size={12} />
-            <Link to={"/knowledge?folder=" + encodeURIComponent(p)}>
+            <Link to={base + "/knowledge?folder=" + encodeURIComponent(p)}>
               {data.folders.find((f) => f.path === p)?.name || parts[i]}
             </Link>
           </span>
@@ -305,39 +329,66 @@ export function Markdown({
           ),
         }}
       >
-        {content}
+        {stripFrontMatter(content)}
       </ReactMarkdown>
     </div>
   );
 }
-export function AIButton({
-  label = "AI Prompt",
-  task,
-  onClick,
+/** One click copies the Markdown prompt; the small toggle opens customization. */
+export function PromptButton({
+  label = "Copy prompt",
+  context,
+  primary = false,
 }: {
   label?: string;
-  task?: PromptInput["task"];
-  onClick?: () => void;
+  context?: Partial<PromptInput>;
+  primary?: boolean;
 }) {
-  const { openPrompt } = useApp();
+  const { copyPrompt, openPrompt } = useApp();
+  const [state, setState] = useState<"idle" | "busy" | "done">("idle");
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const tone = primary ? "primary" : "ai-button";
   return (
-    <button
-      className="button ai-button"
-      onClick={onClick || (() => openPrompt({ task }))}
-    >
-      <Sparkles size={15} />
-      {label}
-    </button>
+    <span className="prompt-split">
+      <button
+        className={"button " + tone}
+        disabled={state === "busy"}
+        onClick={async () => {
+          setState("busy");
+          try {
+            await copyPrompt(context);
+            setState("done");
+            timer.current = setTimeout(() => setState("idle"), 2200);
+          } catch {
+            setState("idle");
+          }
+        }}
+      >
+        {state === "done" ? <Check size={15} /> : <Copy size={15} />}
+        {state === "done" ? "Copied" : label}
+      </button>
+      <button
+        className={"button split-toggle " + tone}
+        aria-label={`Customize: ${label}`}
+        title="Customize before copying"
+        onClick={() => openPrompt(context)}
+      >
+        <SlidersHorizontal size={14} />
+      </button>
+    </span>
   );
 }
 export function FolderTree({
   folders,
   value,
   onChange,
+  rootLabel = "All knowledge",
 }: {
   folders: ResolvedFolder[];
   value: string;
   onChange: (s: string) => void;
+  rootLabel?: string;
 }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const render = (parent: string, depth: number): ReactNode =>
@@ -349,6 +400,9 @@ export function FolderTree({
             0,
             f.path.lastIndexOf("/") < 0 ? 0 : f.path.lastIndexOf("/"),
           ) === parent,
+      )
+      .sort((a, b) =>
+        a.path.localeCompare(b.path, undefined, { numeric: true }),
       )
       .map((f) => {
         const children = folders.some((child) =>
@@ -397,7 +451,8 @@ export function FolderTree({
         onClick={() => onChange("")}
       >
         <Folder size={16} />
-        All knowledge<span>{folders[0]?.documentCount || 0}</span>
+        {rootLabel}
+        <span>{folders[0]?.documentCount || 0}</span>
       </button>
       {render("", 0)}
     </div>
@@ -410,8 +465,9 @@ export function TextLink({
   to: string;
   children: ReactNode;
 }) {
+  const { base } = useApp();
   return (
-    <Link className="text-link" to={to}>
+    <Link className="text-link" to={to.startsWith("/w/") ? to : base + to}>
       {children}
       <ArrowUpRight size={13} />
     </Link>

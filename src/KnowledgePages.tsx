@@ -15,17 +15,17 @@ import {
   Plus,
   Search,
   ShieldCheck,
-  Sparkles,
+  Quote,
   SquarePen,
 } from "lucide-react";
 import type {
-  DocumentMeta,
   DocumentPage as DocPage,
+  Heading,
   ResolvedFolder,
 } from "../shared/types";
 import { api, enc, relativeTime } from "./api";
 import {
-  AIButton,
+  PromptButton,
   Badge,
   Breadcrumb,
   Empty,
@@ -40,7 +40,7 @@ import {
   useApp,
 } from "./ui";
 export function KnowledgePage() {
-  const { data, refresh, notify, openPrompt } = useApp();
+  const { data, base, refresh, notify } = useApp();
   const [params, setParams] = useSearchParams();
   const folderPath = params.get("folder") || "";
   const folder = data.folders.find((f) => f.path === folderPath);
@@ -88,7 +88,7 @@ export function KnowledgePage() {
         <Empty
           title="Folder not found"
           action={
-            <Link to="/knowledge" className="button">
+            <Link to={base + "/knowledge"} className="button">
               Browse knowledge
             </Link>
           }
@@ -109,7 +109,7 @@ export function KnowledgePage() {
             </button>
             <Link
               className="button primary"
-              to={"/changes/new?new=1&folder=" + enc(folderPath)}
+              to={base + "/changes/new?new=1&folder=" + enc(folderPath)}
             >
               <Plus size={16} />
               New document
@@ -125,6 +125,7 @@ export function KnowledgePage() {
             <span>{data.folders.length - 1}</span>
           </div>
           <FolderTree
+            rootLabel={data.workspace.name}
             folders={data.folders}
             value={folderPath}
             onChange={(p) => {
@@ -144,7 +145,7 @@ export function KnowledgePage() {
               {folder.effectivePolicy === "cascade" ? "Cascade" : "Local"}{" "}
               approval
             </Badge>
-            <Link to={"/governance?folder=" + enc(folderPath)}>
+            <Link to={base + "/governance?folder=" + enc(folderPath)}>
               View governance <ArrowUpRight size={12} />
             </Link>
           </div>
@@ -208,7 +209,7 @@ export function KnowledgePage() {
                   !query && (
                     <Link
                       className="button small-button"
-                      to={"/changes/new?new=1&folder=" + enc(folderPath)}
+                      to={base + "/changes/new?new=1&folder=" + enc(folderPath)}
                     >
                       Create a document
                     </Link>
@@ -227,7 +228,7 @@ export function KnowledgePage() {
             {preview && (
               <Link
                 className="text-link"
-                to={"/documents?path=" + enc(preview.path)}
+                to={base + "/documents?path=" + enc(preview.path)}
               >
                 Open document <ArrowUpRight size={14} />
               </Link>
@@ -250,7 +251,7 @@ export function KnowledgePage() {
                 <Markdown content={preview.content} compact />
                 {preview.nextLine && (
                   <Link
-                    to={"/documents?path=" + enc(preview.path)}
+                    to={base + "/documents?path=" + enc(preview.path)}
                     className="text-link"
                   >
                     Continue reading <ArrowRight size={14} />
@@ -258,15 +259,13 @@ export function KnowledgePage() {
                 )}
               </div>
               <div className="preview-actions">
-                <AIButton
-                  label="Explore with AI"
-                  onClick={() =>
-                    openPrompt({ task: "understand", document: preview.path })
-                  }
+                <PromptButton
+                  label="Copy explain prompt"
+                  context={{ screen: "document", document: preview.path }}
                 />
                 <Link
                   className="button"
-                  to={"/changes/new?path=" + enc(preview.path)}
+                  to={base + "/changes/new?path=" + enc(preview.path)}
                 >
                   <SquarePen size={14} />
                   Request change
@@ -381,7 +380,7 @@ function NewFolderModal({
             >
               {data.folders.map((f) => (
                 <option value={f.path} key={f.path}>
-                  {f.path || "Knowledge (root)"}
+                  {f.path || `${data.workspace.name} (root)`}
                 </option>
               ))}
             </select>
@@ -416,12 +415,24 @@ function NewFolderModal({
   );
 }
 export function DocumentPage() {
-  const { data, openPrompt } = useApp();
+  const { data, base } = useApp();
   const [params, setParams] = useSearchParams();
   const p = params.get("path") || "";
   const revision = params.get("revision") || "";
   const startLine = Number(params.get("line") || 1);
   const [doc, setDoc] = useState<DocPage | null>(null);
+  const [outline, setOutline] = useState<{ headings: Heading[] } | null>(null);
+  useEffect(() => {
+    let active = true;
+    setOutline(null);
+    if (p && !revision)
+      api<{ headings: Heading[] }>("/document/outline?path=" + enc(p))
+        .then((o) => active && setOutline(o))
+        .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [p, revision, data.revision]);
   const [content, setContent] = useState("");
   const [error, setError] = useState("");
   const [history, setHistory] = useState<
@@ -478,7 +489,7 @@ export function DocumentPage() {
         {error ? (
           <>
             <ErrorMessage error={error} />
-            <Link className="button" to="/knowledge">
+            <Link className="button" to={base + "/knowledge"}>
               Back to knowledge
             </Link>
           </>
@@ -487,7 +498,22 @@ export function DocumentPage() {
         )}
       </div>
     );
-  const toc = content.match(/^## .+$/gm) || [];
+  const jump = (h: Heading) => {
+    const el = [
+      ...document.querySelectorAll<HTMLElement>(
+        ".document-article .markdown :is(h1,h2,h3,h4,h5,h6)",
+      ),
+    ].find((e) => e.textContent?.trim() === h.title);
+    if (el && startLine === 1)
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    else
+      setParams({
+        path: p,
+        line: String(h.line),
+        ...(revision ? { revision } : {}),
+      });
+  };
+  const prov = doc.provenance;
   return (
     <div className="page document-page">
       <Breadcrumb folder={doc.folder.path} tail={doc.title} />
@@ -515,7 +541,10 @@ export function DocumentPage() {
               <History size={15} />
               History
             </button>
-            <Link className="button primary" to={"/changes/new?path=" + enc(p)}>
+            <Link
+              className="button primary"
+              to={base + "/changes/new?path=" + enc(p)}
+            >
               <SquarePen size={15} />
               Request change
             </Link>
@@ -581,7 +610,7 @@ export function DocumentPage() {
           </div>
           <div className="document-feedback">
             <span>Have an improvement in mind?</span>
-            <Link to={"/changes/new?path=" + enc(p)}>
+            <Link to={base + "/changes/new?path=" + enc(p)}>
               Propose a change <ArrowUpRight size={13} />
             </Link>
           </div>
@@ -619,7 +648,7 @@ export function DocumentPage() {
               </dl>
               <Link
                 className="text-link"
-                to={"/governance?folder=" + enc(doc.folder.path)}
+                to={base + "/governance?folder=" + enc(doc.folder.path)}
               >
                 View folder governance <ArrowUpRight size={13} />
               </Link>
@@ -654,27 +683,83 @@ export function DocumentPage() {
                 ))}
             </div>
             <div className="panel-button">
-              <AIButton label="Explore with AI" task="understand" />
+              <PromptButton label="Copy explain prompt" />
             </div>
           </Panel>
-          <Panel title="On this page">
-            <nav className="toc">
-              {toc.map((h) => (
-                <a
-                  key={h}
-                  href={
-                    "#" +
-                    h
-                      .slice(3)
-                      .toLowerCase()
-                      .replace(/[^a-z0-9]+/g, "-")
-                  }
-                >
-                  {h.slice(3)}
-                </a>
-              ))}
-            </nav>
-          </Panel>
+          {prov && (prov.source || prov.source_uri) && (
+            <Panel
+              title={
+                <>
+                  <Quote size={15} />
+                  Source provenance
+                </>
+              }
+            >
+              <dl className="metadata panel-body">
+                <dt>Source</dt>
+                <dd>
+                  {[prov.source, prov.source_version]
+                    .filter(Boolean)
+                    .join(" ") || "—"}
+                </dd>
+                {prov.source_section && (
+                  <>
+                    <dt>Section</dt>
+                    <dd>§{prov.source_section}</dd>
+                  </>
+                )}
+                {prov.source_pages && (
+                  <>
+                    <dt>PDF pages</dt>
+                    <dd>{prov.source_pages}</dd>
+                  </>
+                )}
+                {prov.source_uri && (
+                  <>
+                    <dt>Location</dt>
+                    <dd className="break">
+                      <a
+                        href={prov.source_uri}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        {prov.source_uri}
+                      </a>
+                    </dd>
+                  </>
+                )}
+                {prov.import && (
+                  <>
+                    <dt>Imported</dt>
+                    <dd>
+                      <Link to={`${base}/imports/${prov.import}`}>
+                        Import #{prov.import}
+                      </Link>
+                    </dd>
+                  </>
+                )}
+              </dl>
+            </Panel>
+          )}
+          {outline && outline.headings.length > 1 && (
+            <Panel title="On this page">
+              <nav className="toc">
+                {outline.headings
+                  .filter((h) => h.level <= 3)
+                  .slice(0, 80)
+                  .map((h) => (
+                    <button
+                      key={h.line}
+                      className={"toc-item level-" + h.level}
+                      onClick={() => jump(h)}
+                      title={`Line ${h.line}`}
+                    >
+                      {h.title}
+                    </button>
+                  ))}
+              </nav>
+            </Panel>
+          )}
           <div className="quiet-note">
             <ShieldCheck size={16} />
             <p>

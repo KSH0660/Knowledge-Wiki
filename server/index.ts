@@ -1,9 +1,8 @@
 import path from "node:path";
 import { mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { Repository } from "./repository.js";
 import { Store } from "./store.js";
-import { KnowledgeService } from "./service.js";
+import { Portal } from "./portal.js";
 import { createApp } from "./app.js";
 import { demoUsers } from "./seed.js";
 import type { User } from "../shared/types.js";
@@ -40,17 +39,23 @@ if (
   )
 )
   throw new Error("Invalid users file");
-const repo = new Repository({
+const defaultSlug = process.env.KNOWLEDGE_DEFAULT_WORKSPACE || "engineering";
+const store = new Store(path.join(dataDir, "knowledge.sqlite"), defaultSlug);
+const portal = new Portal(store, users, {
   dataDir,
-  remote: process.env.KNOWLEDGE_REMOTE,
-  branch: process.env.KNOWLEDGE_BRANCH,
   demo,
-  rootOwner: process.env.KNOWLEDGE_ROOT_OWNER || "sunho",
+  branch: process.env.KNOWLEDGE_BRANCH,
+  remoteTemplate: process.env.KNOWLEDGE_WORKSPACE_REMOTE_TEMPLATE,
+  defaultWorkspace: {
+    slug: defaultSlug,
+    name: process.env.KNOWLEDGE_DEFAULT_WORKSPACE_NAME || "Engineering",
+    description: "Shared knowledge, clear ownership",
+    remote: process.env.KNOWLEDGE_REMOTE,
+    rootOwner: process.env.KNOWLEDGE_ROOT_OWNER || "sunho",
+  },
 });
-const store = new Store(path.join(dataDir, "knowledge.sqlite"));
-const service = new KnowledgeService(repo, store, users);
-await service.init();
-const app = createApp(service, {
+await portal.init();
+const app = createApp(portal, {
   demo,
   proxySecret: process.env.KNOWLEDGE_PROXY_SECRET,
   mcpToken: process.env.KNOWLEDGE_MCP_TOKEN || "knowledge-wiki-local-demo",
@@ -69,13 +74,7 @@ const server = app.listen(port, host, () =>
   ),
 );
 const interval = setInterval(() => {
-  void service
-    .sync()
-    .catch(() =>
-      console.error(
-        "Background repository sync failed; last synchronized knowledge remains available.",
-      ),
-    );
+  void portal.syncAll();
 }, 60000);
 interval.unref();
 for (const signal of ["SIGINT", "SIGTERM"])

@@ -3,32 +3,39 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Code2,
   Copy,
-  Layers3,
+  Eye,
   Settings2,
   Sparkles,
   X,
 } from "lucide-react";
-import { Link } from "react-router-dom";
 import type {
   PersonalSettings,
   PromptInput,
   PromptResult,
   Task,
 } from "../shared/types";
-import { taskLabels } from "../shared/types";
-import { api } from "./api";
-import { Badge, ErrorMessage, IconButton, useApp } from "./ui";
+import { taskDescriptions, taskLabels, tasks } from "../shared/types";
+import { Link } from "react-router-dom";
+import { copyText, portalApi } from "./api";
+import { Badge, ErrorMessage, IconButton, Markdown } from "./ui";
+/**
+ * Secondary surface: change the task, add a one-off instruction, save preferences.
+ * The primary path never needs this — Copy prompt works straight from every page.
+ */
 export function PromptDrawer({
   context,
   onClose,
+  onCopied,
 }: {
   context: Partial<PromptInput>;
   onClose: () => void;
+  onCopied: (r: PromptResult) => void;
 }) {
-  const { notify } = useApp();
   const ref = useRef<HTMLDialogElement>(null);
-  const [task, setTask] = useState<Task>(context.task || "understand");
+  const [task, setTask] = useState<Task | undefined>(context.task);
+  const [recommended, setRecommended] = useState<Task | undefined>();
   const [instruction, setInstruction] = useState("");
   const [include, setInclude] = useState([
     "rationale",
@@ -39,36 +46,31 @@ export function PromptDrawer({
   const [prompt, setPrompt] = useState<PromptResult | null>(null);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  const [view, setView] = useState<"preview" | "source">("preview");
+  const [layersOpen, setLayersOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState("");
   useEffect(() => {
     ref.current?.showModal();
-    if (!context.task)
-      api<PersonalSettings>("/settings")
-        .then((s) => setTask(s.defaultTask))
-        .catch((e) => setError(e.message));
     return () => ref.current?.close();
   }, []);
   useEffect(() => {
     let active = true;
-    setPrompt(null);
     const timer = setTimeout(
       () =>
-        api<PromptResult>("/prompt", {
+        portalApi<PromptResult>("/prompt", {
           method: "POST",
           body: JSON.stringify({ ...context, task, instruction, include }),
         })
           .then((p) => {
-            if (active) {
-              setPrompt(p);
-              setError("");
-              setCopied(false);
-            }
+            if (!active) return;
+            setPrompt(p);
+            if (!task) setRecommended(p.task);
+            setError("");
+            setCopied(false);
           })
-          .catch((e) => {
-            if (active) setError(e.message);
-          }),
-      150,
+          .catch((e) => active && setError(e.message)),
+      task ? 60 : 0,
     );
     return () => {
       active = false;
@@ -76,34 +78,56 @@ export function PromptDrawer({
     };
   }, [task, instruction, include, context]);
   async function copy() {
+    if (!prompt) return;
     try {
-      await navigator.clipboard.writeText(prompt!.text);
+      await copyText(prompt.text);
       setCopied(true);
-      notify("Prompt copied. Ready for your coding agent.");
+      onCopied(prompt);
     } catch {
+      setView("source");
       setError(
-        "Clipboard access is unavailable. Select and copy the prompt preview below.",
+        "Clipboard access is unavailable. Select the Markdown source and copy it.",
       );
     }
   }
-  async function save() {
+  async function save(scope: "task" | "global") {
+    if (!prompt) return;
     setSaving(true);
     try {
-      const settings = await api<PersonalSettings>("/settings");
-      settings.customizations[task] = instruction;
-      await api("/settings", { method: "PUT", body: JSON.stringify(settings) });
-      notify("Your task preference has been saved.");
+      const settings = await portalApi<PersonalSettings>("/settings");
+      if (scope === "global")
+        settings.global = [settings.global, instruction.trim()]
+          .filter(Boolean)
+          .join("\n");
+      else
+        settings.customizations[prompt.task] = [
+          settings.customizations[prompt.task],
+          instruction.trim(),
+        ]
+          .filter(Boolean)
+          .join("\n");
+      await portalApi("/settings", {
+        method: "PUT",
+        body: JSON.stringify(settings),
+      });
+      setSaved(
+        scope === "global"
+          ? "Saved for every task."
+          : `Saved for ${taskLabels[prompt.task]}.`,
+      );
+      setInstruction("");
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setSaving(false);
     }
   }
+  const selected = task || recommended;
   return (
     <dialog
       ref={ref}
       className="prompt-drawer"
-      aria-label="AI Prompt builder"
+      aria-label="Customize AI prompt"
       onCancel={onClose}
       onClick={(e) => {
         if (e.target === ref.current) onClose();
@@ -114,72 +138,34 @@ export function PromptDrawer({
           <Sparkles size={21} />
         </div>
         <div>
-          <h2>AI Prompt</h2>
-          <p>The right context. Ready for your agent.</p>
+          <h2>Customize prompt</h2>
+          <p>
+            Optional. The Copy prompt button already uses the recommended task.
+          </p>
         </div>
-        <IconButton label="Close AI Prompt" onClick={onClose}>
+        <IconButton label="Close" onClick={onClose}>
           <X size={19} />
         </IconButton>
       </div>
       <div className="drawer-content">
-        <div className="callout subtle">
-          <Layers3 size={17} />
-          <p>
-            A context-aware prompt, assembled from your workspace’s instructions
-            and your preferences.
-          </p>
-        </div>
-        <label className="field-label" htmlFor="prompt-task">
-          What would you like to do?
-        </label>
-        <select
-          id="prompt-task"
-          value={task}
-          onChange={(e) => setTask(e.target.value as Task)}
-        >
-          {Object.entries(taskLabels).map(([k, v]) => (
-            <option key={k} value={k}>
-              {v}
-            </option>
+        <div className="section-label">TASK</div>
+        <div className="task-chips" role="radiogroup" aria-label="Prompt task">
+          {tasks.map((t) => (
+            <button
+              key={t}
+              role="radio"
+              aria-checked={selected === t}
+              title={taskDescriptions[t]}
+              className={"chip " + (selected === t ? "active" : "")}
+              onClick={() => setTask(t)}
+            >
+              {selected === t && <Check size={11} />} {taskLabels[t]}
+              {recommended === t && (
+                <span className="chip-note">recommended</span>
+              )}
+            </button>
           ))}
-        </select>
-        <div className="section-label">
-          PROMPT CONTEXT <span>{prompt?.layers.length || "…"} layers</span>
         </div>
-        <div className="prompt-layers">
-          {prompt?.layers
-            .filter((l) => l.kind !== "One-off")
-            .map((layer, i) => (
-              <div className="prompt-layer" key={i}>
-                <div>
-                  <span className="step-number">{i + 1}</span>
-                  <strong>{layer.name}</strong>
-                  <Badge
-                    tone={
-                      layer.kind === "Task"
-                        ? "purple"
-                        : layer.kind === "Personal"
-                          ? "gray"
-                          : "blue"
-                    }
-                  >
-                    {layer.kind}
-                  </Badge>
-                </div>
-                <p>
-                  {layer.text.slice(0, expanded ? undefined : 135)}
-                  {!expanded && layer.text.length > 135 ? "…" : ""}
-                </p>
-              </div>
-            ))}
-        </div>
-        <button
-          className="text-button expand-layers"
-          onClick={() => setExpanded(!expanded)}
-        >
-          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}{" "}
-          {expanded ? "Show less" : "Show full instructions"}
-        </button>
         {context.changeId && (
           <>
             <div className="section-label">INCLUDE IN CONTEXT</div>
@@ -202,48 +188,123 @@ export function PromptDrawer({
           </>
         )}
         <label className="field-label" htmlFor="one-off">
-          Additional instruction <span>Optional</span>
+          One-off instruction <span>Optional · added last</span>
         </label>
         <textarea
           id="one-off"
           rows={3}
-          placeholder="e.g. Focus on compatibility and downstream impact…"
+          placeholder="e.g. Focus on the FADT flags and compare with ACPI 6.5…"
           value={instruction}
-          onChange={(e) => setInstruction(e.target.value)}
+          onChange={(e) => {
+            setInstruction(e.target.value);
+            setSaved("");
+          }}
         />
+        {instruction.trim() && (
+          <div className="save-row">
+            <span>Keep this for next time?</span>
+            <button
+              className="text-button"
+              disabled={saving}
+              onClick={() => save("task")}
+            >
+              Save for {prompt ? taskLabels[prompt.task] : "this task"}
+            </button>
+            <button
+              className="text-button"
+              disabled={saving}
+              onClick={() => save("global")}
+            >
+              Save for all tasks
+            </button>
+          </div>
+        )}
+        {saved && <p className="small success-text">{saved}</p>}
+        <button
+          className="text-button expand-layers"
+          onClick={() => setLayersOpen(!layersOpen)}
+        >
+          {layersOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}{" "}
+          How this prompt is built · {prompt?.layers.length || "…"} layers
+        </button>
+        {layersOpen && (
+          <div className="prompt-layers">
+            {prompt?.layers.map((layer, i) => (
+              <div className="prompt-layer" key={i}>
+                <div>
+                  <span className="step-number">{i + 1}</span>
+                  <strong>{layer.name}</strong>
+                  <Badge
+                    tone={
+                      layer.kind === "Task"
+                        ? "purple"
+                        : layer.kind === "Personal" || layer.kind === "One-off"
+                          ? "gray"
+                          : "blue"
+                    }
+                  >
+                    {layer.kind}
+                  </Badge>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="preview-heading">
-          <span className="section-label">PROMPT PREVIEW</span>
-          <span>{prompt?.text.length.toLocaleString() || 0} characters</span>
+          <div className="tabs compact-tabs" role="tablist">
+            <button
+              role="tab"
+              aria-selected={view === "preview"}
+              className={view === "preview" ? "active" : ""}
+              onClick={() => setView("preview")}
+            >
+              <Eye size={13} /> Preview
+            </button>
+            <button
+              role="tab"
+              aria-selected={view === "source"}
+              className={view === "source" ? "active" : ""}
+              onClick={() => setView("source")}
+            >
+              <Code2 size={13} /> Markdown source
+            </button>
+          </div>
+          <span>
+            {prompt?.text.length.toLocaleString() || 0} characters · copies the
+            source
+          </span>
         </div>
-        <textarea
-          aria-label="Generated prompt preview"
-          className="prompt-preview"
-          readOnly
-          value={prompt?.text || "Assembling your prompt…"}
-          rows={7}
-        />
+        {view === "preview" ? (
+          <div className="prompt-rendered" aria-label="Rendered prompt preview">
+            {prompt ? (
+              <Markdown content={prompt.text} compact />
+            ) : (
+              "Assembling your prompt…"
+            )}
+          </div>
+        ) : (
+          <textarea
+            aria-label="Markdown prompt source"
+            className="prompt-preview"
+            readOnly
+            value={prompt?.text || "Assembling your prompt…"}
+            rows={14}
+          />
+        )}
         <ErrorMessage error={error} />
-        <p className="small muted prompt-note">
-          AI helps you investigate. Approval stays with the responsible human
-          owner.
-        </p>
       </div>
       <div className="drawer-footer">
-        <Link
-          to="/settings"
-          onClick={onClose}
-          className="icon-button"
-          title="Personal AI settings"
-        >
-          <Settings2 size={17} />
-        </Link>
-        <button
-          className="button"
-          disabled={!instruction.trim() || saving}
-          onClick={save}
-        >
-          {saving ? "Saving…" : "Save preference"}
-        </button>
+        {context.workspace && (
+          <Link
+            to={`/w/${context.workspace}/settings`}
+            onClick={onClose}
+            className="icon-button"
+            title="AI prompt settings"
+          >
+            <Settings2 size={17} />
+          </Link>
+        )}
+        <span className="footer-note">{prompt ? prompt.title : ""}</span>
         <button className="button primary" onClick={copy} disabled={!prompt}>
           {copied ? <Check size={15} /> : <Copy size={15} />}{" "}
           {copied ? "Copied" : "Copy prompt"}

@@ -16,6 +16,7 @@ import { KnowledgeService } from "../server/service.js";
 import { Store } from "../server/store.js";
 import { demoUsers } from "../server/seed.js";
 import { createApp } from "../server/app.js";
+import { Portal } from "../server/portal.js";
 import type { Actor } from "../shared/types.js";
 const human = (id: string): Actor => ({ id, kind: "human" });
 const sunho = human("sunho"),
@@ -25,16 +26,26 @@ const timing = "memory/ddr6/timing/refresh-timing.md";
 const cascade = "memory/ddr6/refresh/self-refresh.md";
 async function fixture(t: test.TestContext) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "knowledge-wiki-test-"));
-  const repo = new Repository({ dataDir: dir, demo: true, rootOwner: "sunho" });
   const store = new Store(path.join(dir, "knowledge.sqlite"));
   store.setMeta("seeded", "true");
-  const service = new KnowledgeService(repo, store, demoUsers);
-  await service.init();
+  const portal = new Portal(store, demoUsers, {
+    dataDir: dir,
+    demo: true,
+    defaultWorkspace: {
+      slug: "engineering",
+      name: "Engineering",
+      description: "",
+      rootOwner: "sunho",
+    },
+  });
+  await portal.init();
+  const service = portal.get();
+  const repo = service.repo;
   t.after(async () => {
     store.close();
     await rm(dir, { recursive: true, force: true });
   });
-  return { dir, repo, store, service };
+  return { dir, repo, store, service, portal };
 }
 function proposal(
   repo: Repository,
@@ -319,20 +330,24 @@ test("prompt assembly preserves inherited order, personal preferences, and bound
     prompt.layers.map((l) => l.name),
     [
       "Portal guidelines",
-      "Knowledge",
-      "Memory Systems",
-      "DDR6",
-      "Timing",
-      "Review a change request",
-      "Your preferences",
+      "Workspace & folder instructions",
+      "Task: Review",
+      "My preferences",
       "Current context",
-      "One-off instruction",
+      "Additional instruction",
     ],
   );
+  const inherited = prompt.layers[1].text;
+  const order = ["Engineering", "Memory Systems", "DDR6", "Timing"].map((n) =>
+    inherited.indexOf("### " + n),
+  );
+  assert.ok(order.every((i, k) => i >= 0 && (k === 0 || i > order[k - 1])));
   assert.match(prompt.text, /Personal review sentinel/);
   assert.match(prompt.text, /get_change_request/);
   assert.ok(!prompt.text.includes(cr.files[0].content));
   assert.equal(prompt.layers.at(-1)?.text, "One-off sentinel");
+  assert.match(prompt.text, /^# Review CR-\d+/);
+  assert.match(prompt.text, /```text\nget_change_request/);
 });
 
 test("paths, root responsibility, inherited scope and stale governance writes are guarded", async (t) => {
@@ -400,10 +415,10 @@ test("draft proposals, personal settings, and workflow survive a fresh database 
 });
 
 test("HTTP authorization and official MCP client share the same knowledge service", async (t) => {
-  const { service, repo } = await fixture(t);
+  const { service, repo, portal } = await fixture(t);
   const proxySecret = "a".repeat(40),
     mcpToken = "b".repeat(40);
-  const app = createApp(service, {
+  const app = createApp(portal, {
     demo: false,
     proxySecret,
     mcpToken,
@@ -414,13 +429,16 @@ test("HTTP authorization and official MCP client share the same knowledge servic
   t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
   const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   assert.equal(
-    (await fetch(url + "/api/catalog", { headers: { "x-demo-user": "sunho" } }))
-      .status,
+    (
+      await fetch(url + "/api/w/engineering/catalog", {
+        headers: { "x-demo-user": "sunho" },
+      })
+    ).status,
     401,
   );
   assert.equal(
     (
-      await fetch(url + "/api/catalog", {
+      await fetch(url + "/api/w/engineering/catalog", {
         headers: {
           "x-auth-user": "sunho",
           "x-proxy-secret": proxySecret,
@@ -431,7 +449,10 @@ test("HTTP authorization and official MCP client share the same knowledge servic
     403,
   );
   const headers = { "x-auth-user": "sunho", "x-proxy-secret": proxySecret };
-  assert.equal((await fetch(url + "/api/catalog", { headers })).status, 200);
+  assert.equal(
+    (await fetch(url + "/api/w/engineering/catalog", { headers })).status,
+    200,
+  );
   assert.equal(
     (
       await fetch(url + "/mcp", {
@@ -453,7 +474,7 @@ test("HTTP authorization and official MCP client share the same knowledge servic
   );
   t.after(() => client.close());
   const list = await client.listTools();
-  assert.equal(list.tools.length, 5);
+  assert.equal(list.tools.length, 13);
   assert.ok(!list.tools.some((t) => /approve|governance/.test(t.name)));
   const found = await client.callTool({
     name: "search_knowledge",
@@ -465,9 +486,14 @@ test("HTTP authorization and official MCP client share the same knowledge servic
     name: "read_document",
     arguments: { path: timing, start_line: 1, limit: 3 },
   });
-  const page = JSON.parse((read.content as { text: string }[])[0].text);
+  const [meta, body] = read.content as { text: string }[];
+  const page = JSON.parse(meta.text);
   assert.equal(page.nextLine, 4);
   assert.ok(page.hash);
+  assert.equal(
+    body.text,
+    repo.docs.get(timing)!.content.split("\n").slice(0, 3).join("\n") + "\n",
+  );
   const created = await client.callTool({
     name: "create_change_request",
     arguments: proposal(repo),

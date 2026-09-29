@@ -5,6 +5,7 @@ import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { Actor } from "../shared/types.js";
 import type { KnowledgeService } from "./service.js";
+import type { Portal } from "./portal.js";
 import { DomainError } from "./repository.js";
 import { changeSchema, promptSchema, settingsSchema } from "./schemas.js";
 import { handleMcp } from "./mcp.js";
@@ -20,7 +21,7 @@ const equal = (a: string, b: string) => {
     right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
-export function createApp(service: KnowledgeService, config: AppConfig) {
+export function createApp(portal: Portal, config: AppConfig) {
   const app = express();
   app.disable("x-powered-by");
   app.use((req, res, next) => {
@@ -35,8 +36,11 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
   });
   app.get("/api/health", (_req, res) =>
     res.json({
-      status: service.repo.syncError ? "degraded" : "ok",
-      version: "1.0.0",
+      status: [...portal.services.values()].some((s) => s.repo.syncError)
+        ? "degraded"
+        : "ok",
+      version: "1.1.0",
+      workspaces: portal.services.size,
     }),
   );
   app.use(express.json({ limit: "22mb" }));
@@ -61,7 +65,12 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
         .status(401)
         .json({ error: "A valid MCP bearer token is required." });
     try {
-      await handleMcp(service, req, res);
+      await handleMcp(
+        portal,
+        req,
+        res,
+        config.origin || `${req.protocol}://${req.get("host")}`,
+      );
     } catch (e) {
       next(e);
     }
@@ -81,7 +90,7 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
       return res
         .status(401)
         .json({ error: "Trusted proxy authentication is required." });
-    if (!id || !service.users.find((u) => u.id === id))
+    if (!id || !portal.users.find((u) => u.id === id))
       return res
         .status(401)
         .json({ error: "Your account is not registered in Knowledge Wiki." });
@@ -93,22 +102,82 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
     z.coerce.number().int().positive().parse(req.params.id);
   const str = (x: unknown, defaultValue = "") =>
     z.string().parse(x ?? defaultValue);
-  app.get("/api/catalog", (_req, res) => res.json(service.catalog(actor(res))));
-  app.post("/api/sync", async (_req, res) => {
-    await service.sync();
-    res.json(service.catalog(actor(res)));
-  });
-  app.get("/api/search", (req, res) =>
-    res.json(service.search(str(req.query.q), str(req.query.folder))),
+  const origin = (req: Request) =>
+    config.origin || `${req.protocol}://${req.get("host")}`;
+  app.get("/api/me", (_req, res) =>
+    res.json({
+      user: portal.users.find((u) => u.id === actor(res).id),
+      users: portal.users,
+      demo: config.demo,
+      defaultWorkspace: portal.config.defaultWorkspace.slug,
+    }),
   );
-  app.get("/api/document", async (req, res) => {
+  app.get("/api/workspaces", (_req, res) => res.json(portal.list(actor(res))));
+  app.post("/api/workspaces", async (req, res) =>
+    res.status(201).json(
+      await portal.create(
+        actor(res),
+        z
+          .object({
+            slug: z.string().trim().min(2).max(40),
+            name: z.string().trim().min(1).max(80),
+            description: z.string().max(300).optional(),
+            instructions: z.string().max(8000).optional(),
+          })
+          .parse(req.body),
+      ),
+    ),
+  );
+  app.get("/api/settings", (_req, res) =>
+    res.json(portal.store.settings(actor(res).id)),
+  );
+  app.put("/api/settings", (req, res) => {
+    portal.store.saveSettings(actor(res).id, settingsSchema.parse(req.body));
+    res.json(portal.store.settings(actor(res).id));
+  });
+  app.get("/api/portal", (_req, res) => res.json(portal.portalInstructions()));
+  app.put("/api/portal", (req, res) =>
+    res.json(
+      portal.setPortalInstructions(
+        actor(res),
+        z.object({ text: z.string().max(8000).nullable() }).parse(req.body)
+          .text,
+      ),
+    ),
+  );
+  app.post("/api/prompt", (req, res) =>
+    res.json(
+      portal.prompt(actor(res), promptSchema.parse(req.body), origin(req)),
+    ),
+  );
+  const ws = express.Router({ mergeParams: true });
+  app.use(
+    "/api/w/:ws",
+    (req, res, next) => {
+      res.locals.service = portal.get(String(req.params.ws));
+      next();
+    },
+    ws,
+  );
+  const svc = (res: Response) => res.locals.service as KnowledgeService;
+  ws.get("/catalog", (_req, res) => res.json(svc(res).catalog(actor(res))));
+  ws.post("/sync", async (_req, res) => {
+    await svc(res).sync();
+    res.json(svc(res).catalog(actor(res)));
+  });
+  ws.get("/search", (req, res) =>
+    res.json(svc(res).search(str(req.query.q), str(req.query.folder))),
+  );
+  ws.get("/document", async (req, res) => {
     const p = str(req.query.path);
+    if (req.query.section)
+      return res.json(svc(res).readSection(p, str(req.query.section)));
     const revision = req.query.revision ? str(req.query.revision) : undefined;
     const content = revision
-      ? await service.repo.historical(p, revision)
+      ? await svc(res).repo.historical(p, revision)
       : undefined;
     res.json(
-      service.read(
+      svc(res).read(
         p,
         Number(req.query.startLine || 1),
         Number(req.query.limit || 100),
@@ -118,23 +187,24 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
       ),
     );
   });
-  app.get("/api/document/edit", (req, res) => {
-    const p = str(req.query.path);
-    const doc = service.repo.docs.get(p);
-    if (!doc) throw new DomainError(404, "Document not found");
+  ws.get("/document/outline", (req, res) =>
+    res.json(svc(res).outline(str(req.query.path))),
+  );
+  ws.get("/document/edit", (req, res) => {
+    const doc = svc(res).doc(str(req.query.path));
     if (doc.content.length > 2_000_000)
       throw new DomainError(
         413,
-        "This document exceeds the web editor limit of 2 MB. Split it into smaller documents through your repository administrator.",
+        "This document exceeds the web editor limit of 2 MB. Propose focused edits through an agent (MCP edits) instead.",
       );
     res.json({ ...doc.meta, content: doc.content });
   });
-  app.get("/api/document/history", async (req, res) =>
-    res.json(await service.repo.history(str(req.query.path))),
+  ws.get("/document/history", async (req, res) =>
+    res.json(await svc(res).repo.history(str(req.query.path))),
   );
-  app.post("/api/folders", async (req, res) =>
+  ws.post("/folders", async (req, res) =>
     res.status(201).json(
-      await service.createFolder(
+      await svc(res).createFolder(
         actor(res),
         z
           .object({
@@ -147,9 +217,9 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
       ),
     ),
   );
-  app.put("/api/governance", async (req, res) =>
+  ws.put("/governance", async (req, res) =>
     res.json(
-      await service.governance(
+      await svc(res).governance(
         actor(res),
         z
           .object({
@@ -158,41 +228,40 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
             policy: z.enum(["local", "cascade"]).nullable(),
             instructions: z.string().max(8000),
             description: z.string().max(500),
+            watchers: z.array(z.string().max(100)).max(50).optional(),
             revision: z.string(),
           })
           .parse(req.body),
       ),
     ),
   );
-  app.get("/api/changes/:id", (req, res) =>
-    res.json(service.getChange(id(req))),
-  );
-  app.post("/api/changes", async (req, res) =>
+  ws.get("/changes/:id", (req, res) => res.json(svc(res).getChange(id(req))));
+  ws.post("/changes", async (req, res) =>
     res
       .status(201)
       .json(
-        await service.createChange(actor(res), changeSchema.parse(req.body)),
+        await svc(res).createChange(actor(res), changeSchema.parse(req.body)),
       ),
   );
-  app.put("/api/changes/:id", async (req, res) =>
+  ws.put("/changes/:id", async (req, res) =>
     res.json(
-      await service.createChange(
+      await svc(res).createChange(
         actor(res),
         changeSchema.parse(req.body),
         id(req),
       ),
     ),
   );
-  app.post("/api/changes/:id/review", async (req, res) => {
+  ws.post("/changes/:id/review", async (req, res) => {
     const data = z
       .object({
-        decision: z.enum(["approve", "request_changes"]),
+        decision: z.enum(["approve", "request_changes", "reject"]),
         comment: z.string().max(5000).default(""),
         version: z.number().int().positive(),
       })
       .parse(req.body);
     res.json(
-      await service.review(
+      await svc(res).review(
         actor(res),
         id(req),
         data.decision,
@@ -201,9 +270,9 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
       ),
     );
   });
-  app.post("/api/changes/:id/comments", async (req, res) =>
+  ws.post("/changes/:id/comments", async (req, res) =>
     res.json(
-      await service.comment(
+      await svc(res).comment(
         actor(res),
         id(req),
         z.object({ text: z.string().trim().min(1).max(5000) }).parse(req.body)
@@ -211,14 +280,37 @@ export function createApp(service: KnowledgeService, config: AppConfig) {
       ),
     ),
   );
-  app.get("/api/settings", (_req, res) =>
-    res.json(service.settings(actor(res))),
+  ws.get("/imports", (_req, res) => res.json(svc(res).imports.list()));
+  ws.get("/imports/:id", (req, res) =>
+    res.json({
+      ...svc(res).imports.get(id(req)),
+      files: svc(res).store.stagedFiles(id(req)),
+    }),
   );
-  app.put("/api/settings", (req, res) =>
-    res.json(service.saveSettings(actor(res), settingsSchema.parse(req.body))),
+  ws.get("/imports/:id/file", (req, res) =>
+    res.json(
+      svc(res).imports.read(
+        id(req),
+        str(req.query.path),
+        Number(req.query.startLine || 1),
+        Number(req.query.limit || 200),
+      ),
+    ),
   );
-  app.post("/api/prompt", (req, res) =>
-    res.json(service.prompt(actor(res), promptSchema.parse(req.body))),
+  const decision = (req: Request) =>
+    z
+      .object({ comment: z.string().max(5000).default("") })
+      .parse(req.body ?? {}).comment;
+  ws.post("/imports/:id/commit", async (req, res) =>
+    res.json(await svc(res).imports.commit(actor(res), id(req), decision(req))),
+  );
+  ws.post("/imports/:id/discard", (req, res) =>
+    res.json(svc(res).imports.discard(actor(res), id(req), decision(req))),
+  );
+  ws.post("/prompt", (req, res) =>
+    res.json(
+      svc(res).prompt(actor(res), promptSchema.parse(req.body), origin(req)),
+    ),
   );
   app.use("/api", (_req, res) =>
     res.status(404).json({ error: "API endpoint not found" }),
