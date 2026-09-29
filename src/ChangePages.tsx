@@ -573,7 +573,7 @@ export function CreateChangePage() {
   ];
   const fyi = [
     ...new Set(files.flatMap((f) => scopeOf(f.path)?.fyiIds || [])),
-  ].filter((id) => !approvers.includes(id));
+  ].filter((id) => !approvers.includes(id) && id !== data.user.id);
   usePromptContext({
     screen: "compose",
     folder: newDoc

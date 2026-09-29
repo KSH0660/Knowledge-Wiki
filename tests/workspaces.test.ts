@@ -311,8 +311,8 @@ test("bootstrap import stages outside Git, filters junk, keeps provenance, and c
     /^---\ntitle: "?2\.1 Overview"?\nsource: Example Spec\nsource_version: "?1\.0"?\n/,
   );
   assert.match(md, /source_pages: 10-12/);
-  assert.match(md, /## 2\.1\.1 Scope\n\n> Source: §2\.1\.1, pp\. 10–11/);
-  assert.match(md, /## 2\.1\.2 Registers\n\n> Source: §2\.1\.2, p\. 12/);
+  assert.match(md, /## 2\.1\.1 Scope\n\n> Source: §2\.1\.1, PDF pp\. 10–11/);
+  assert.match(md, /## 2\.1\.2 Registers\n\n> Source: §2\.1\.2, PDF p\. 12/);
   assert.equal(
     ws.imports.read(session.id, "spec-1.0/guides/intro.md").content,
     "# Intro\n\nKeep me as-is.  \n",
@@ -355,6 +355,11 @@ test("bootstrap import stages outside Git, filters junk, keeps provenance, and c
   );
   const hit = ws.search("reset", "spec-1.0")[0];
   assert.equal(hit.section, "2.1.1 Scope");
+  // The hit points at the exact line, so an agent can read a tiny window.
+  assert.match(doc.content.split("\n")[hit.line - 1], /shall\*\* reset/);
+  // A rare term outranks a common one when choosing the hit line.
+  const rare = ws.search("source uint32_t", "spec-1.0")[0];
+  assert.match(doc.content.split("\n")[rare.line - 1], /uint32_t reg/);
   const section = ws.readSection(doc.meta.path, "2.1.2");
   assert.match(section.content, /uint32_t reg/);
   assert.doesNotMatch(section.content, /shall/);
@@ -469,26 +474,22 @@ test("v1 databases migrate to workspaces without losing workflow or settings", a
   old.exec(
     `CREATE TABLE changes (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL); CREATE TABLE settings (user_id TEXT PRIMARY KEY, data TEXT NOT NULL); CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE VIRTUAL TABLE chunks USING fts5(path UNINDEXED, title, content, start_line UNINDEXED, end_line UNINDEXED, revision UNINDEXED, tokenize='unicode61'); PRAGMA user_version=1;`,
   );
-  old
-    .prepare("INSERT INTO changes(data) VALUES(?)")
-    .run(
-      JSON.stringify({
-        title: "Legacy",
-        files: [],
-        reviews: [],
-        comments: [],
-        status: "draft",
-      }),
-    );
-  old
-    .prepare("INSERT INTO settings VALUES(?,?)")
-    .run(
-      "min",
-      JSON.stringify({
-        defaultTask: "understand",
-        customizations: { understand: "Legacy explain pref", review: "r" },
-      }),
-    );
+  old.prepare("INSERT INTO changes(data) VALUES(?)").run(
+    JSON.stringify({
+      title: "Legacy",
+      files: [],
+      reviews: [],
+      comments: [],
+      status: "draft",
+    }),
+  );
+  old.prepare("INSERT INTO settings VALUES(?,?)").run(
+    "min",
+    JSON.stringify({
+      defaultTask: "understand",
+      customizations: { understand: "Legacy explain pref", review: "r" },
+    }),
+  );
   old.prepare("INSERT INTO metadata VALUES('indexed_revision','abc')").run();
   old.close();
   const store = new Store(file, "engineering");
@@ -509,4 +510,49 @@ test("v1 databases migrate to workspaces without losing workflow or settings", a
     store.close();
   }
   assert.ok((await readFile(file)).length > 0);
+});
+
+test("E2E regressions: authors are never FYI on their own CR; empty queues summarize recent decisions; empty targets start with start_import", async (t) => {
+  const { portal, eng } = await fixture(t);
+  // alex owns memory/ (ancestor of timing): he is FYI for others, never for himself.
+  const doc = eng.repo.docs.get(timing)!;
+  const own = await eng.createChange(alex, {
+    title: "Alex edits timing",
+    rationale: "Own proposal.",
+    files: [
+      {
+        path: timing,
+        baseHash: doc.meta.hash,
+        content: doc.content + "\nnote\n",
+      },
+    ],
+  });
+  assert.deepEqual(own.fyiIds, []);
+  assert.deepEqual(eng.getChange(own.id).fyiIds, []);
+  await eng.review(sunho, own.id, "reject", "Out of scope.", 1);
+  // min has nothing to review: the queue prompt digests recent decisions instead.
+  const queue = portal.prompt(min, {
+    workspace: "engineering",
+    screen: "reviews",
+  });
+  const pendingForMin = eng.catalog(min).workspace.pendingReviews;
+  assert.equal(pendingForMin, 0);
+  assert.match(queue.title, /^Summarize recent decisions/);
+  assert.match(
+    queue.text,
+    new RegExp(
+      `Recently decided: CR-${own.id} "Alex edits timing" \\(rejected\\)`,
+    ),
+  );
+  assert.match(
+    queue.text,
+    new RegExp(
+      '```text\\nget_change_request \\{"workspace":"engineering","change_id":' +
+        own.id,
+    ),
+  );
+  assert.doesNotMatch(queue.text, /- Owner: /);
+  await portal.create(yuna, { slug: "fresh", name: "Fresh" });
+  const ingest = portal.prompt(yuna, { workspace: "fresh" });
+  assert.match(ingest.text, /```text\nstart_import \{"workspace":"fresh"/);
 });

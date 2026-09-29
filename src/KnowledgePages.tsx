@@ -60,7 +60,7 @@ export function KnowledgePage() {
     )
     .sort((a, b) =>
       sort === "title"
-        ? a.title.localeCompare(b.title)
+        ? a.title.localeCompare(b.title, undefined, { numeric: true })
         : b.updatedAt.localeCompare(a.updatedAt),
     );
   const selectedPath = docs.some((d) => d.path === selected)
@@ -670,17 +670,15 @@ export function DocumentPage() {
                   <p>Search first. Cite sources. Keep humans accountable.</p>
                 </span>
               </div>
-              {doc.folder.instructionLayers
-                .filter((l) => l.path)
-                .map((l, i) => (
-                  <div key={l.path}>
-                    <span className="step-number">{i + 2}</span>
-                    <span>
-                      <strong>{l.name}</strong>
-                      <p>{l.text}</p>
-                    </span>
-                  </div>
-                ))}
+              {doc.folder.instructionLayers.map((l, i) => (
+                <div key={l.path || "/"}>
+                  <span className="step-number">{i + 2}</span>
+                  <span>
+                    <strong>{l.name}</strong>
+                    <p>{l.text}</p>
+                  </span>
+                </div>
+              ))}
             </div>
             <div className="panel-button">
               <PromptButton label="Copy explain prompt" />

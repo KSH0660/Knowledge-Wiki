@@ -63,6 +63,8 @@ interface Ctx {
   imp?: ImportSession;
   queue: ChangeRequest[];
   fyi: ChangeRequest[];
+  /** Recently decided change requests, shown when nothing is waiting. */
+  recent: ChangeRequest[];
   allOpen: boolean;
   origin?: string;
   page?: string;
@@ -211,16 +213,14 @@ function plan(task: Task, ctx: Ctx): Plan {
   const startCr = cr
     ? [
         call("get_change_request", { workspace: ws, change_id: cr.id }),
-        ...cr.files
-          .slice(0, 3)
-          .map((x) =>
-            call("get_change_request", {
-              workspace: ws,
-              change_id: cr.id,
-              file_path: x.path,
-              view: "diff",
-            }),
-          ),
+        ...cr.files.slice(0, 3).map((x) =>
+          call("get_change_request", {
+            workspace: ws,
+            change_id: cr.id,
+            file_path: x.path,
+            view: "diff",
+          }),
+        ),
       ]
     : [];
   const startBrowse = [call("browse", { workspace: ws, folder: f, depth: 2 })];
@@ -442,6 +442,24 @@ function plan(task: Task, ctx: Ctx): Plan {
           deliver: "A short status summary with decisions and open questions.",
           start: startCr.slice(0, 2),
         };
+      if (ctx.subject === "queue" && !ctx.queue.length && !ctx.fyi.length)
+        return {
+          title: `Summarize recent decisions in ${ctx.svc.workspace.name}`,
+          steps: [
+            ctx.allOpen
+              ? "No change requests are open right now."
+              : "Nothing is waiting for your approval right now.",
+            'Summarize the recently decided change requests listed in **Current context**: read each with `get_change_request` (metadata first; `view: "diff"` only where the change is unclear).',
+            "For each: what changed, who decided, and whether follow-up work remains (e.g. a rejected proposal that should be re-scoped).",
+          ],
+          deliver:
+            "A short digest of recent decisions and suggested follow-ups.",
+          start: ctx.recent
+            .slice(0, 2)
+            .map((c) =>
+              call("get_change_request", { workspace: ws, change_id: c.id }),
+            ),
+        };
       if (ctx.subject === "queue")
         return {
           title: ctx.allOpen
@@ -505,14 +523,28 @@ function plan(task: Task, ctx: Ctx): Plan {
           "Take the source from **Additional instruction** (a Markdown directory, or an external document such as a PDF specification). Ask the user if none is given.",
           `Open a staging session: ${inline("start_import", { workspace: ws, title: "<source name>", target_folder: f, source: { title: "<title>", version: "<version>", uri: "<url>" } })}. It returns \`import_id\` and the rules.`,
           "**Directory migration:** keep curated `.md` files only; exclude cache/build/log/temp/generated output. Send batches (≤100 files, ≤4 MB) with `stage_import_files`, using each file's original relative `source_path`. Do not edit, rename or reorganize anything.",
-          "**External document (PDF, …):** never load the whole file. Read the table of contents/bookmarks first and mirror the source's own structure (part/chapter → folder, top-level numbered section → one document, e.g. `05-software-programming-model/5.2-system-description-tables.md`). Then read one page range at a time, normalize it to Markdown (sub-headings per subsection, GFM tables, fenced code, verbatim normative text — no summarizing) and stage batches with `stage_normalized_documents` (`sections[]` with `number`, `title`, `level`, `pages`, `content`; folder display names in `folders`).",
+          "**External document (PDF, …):** never load the whole file. Read the table of contents/bookmarks first and mirror the source's own structure (part/chapter → folder, top-level numbered section → one document, e.g. `05-software-programming-model/5.2-system-description-tables.md`). Then read one page range at a time and normalize it to Markdown: strip running headers/footers and page numbers (they often repeat section titles — anchor each section at its real heading), sub-headings per subsection, GFM tables, fenced code, verbatim normative text — no summarizing. Stage batches with `stage_normalized_documents` (`intro` for text before the first subsection; `sections[]` with `number`, `title`, `level`, `pages` as 1-based PDF pages, `content`; folder display names in `folders`).",
           "Check progress with `get_import` (counts, skipped files, one sample file).",
           "Finish with `submit_import`, adding notes and structure-improvement `suggestions` — never apply them during migration.",
           `Tell the user that ${ctx.names([ctx.svc.rootOwnerId])} (root owner) reviews and commits the import once in the web UI. Nothing reaches Git before that.`,
         ],
         deliver:
           "The import id, what was staged and skipped (with reasons), and the suggestions submitted.",
-        start: [call("browse", { workspace: ws, folder: f, depth: 1 })],
+        // An empty target needs no browsing: the context already says so.
+        start: [
+          folder.documentCount
+            ? call("browse", { workspace: ws, folder: f, depth: 1 })
+            : call("start_import", {
+                workspace: ws,
+                title: "<source name>",
+                target_folder: f,
+                source: {
+                  title: "<title>",
+                  version: "<version>",
+                  uri: "<url>",
+                },
+              }),
+        ],
       };
     }
   }
@@ -523,7 +555,7 @@ function context(ctx: Ctx, task: Task) {
   const lines: string[] = [];
   const add = (s: string) => lines.push(s);
   add(
-    `- Screen: ${screens[ctx.subject]}${ctx.origin ? ` — ${ctx.origin}${ctx.page || `/w/${ctx.ws}`}` : ""}`,
+    `- Screen: ${ctx.allOpen ? "Change requests" : screens[ctx.subject]}${ctx.origin ? ` — ${ctx.origin}${ctx.page || `/w/${ctx.ws}`}` : ""}`,
   );
   add(
     `- Workspace: **${svc.workspace.name}** (${code(ctx.ws)}) · revision ${code(short(svc.repo.revision))} · ${plural(svc.repo.docs.size, "document")} · root owner ${ctx.names([svc.rootOwnerId])}`,
@@ -565,7 +597,7 @@ function context(ctx: Ctx, task: Task) {
         `- Sections: ${top.map((h) => `${h.title} (L${h.line})`).join("; ")}${doc.outline.filter((h) => h.level <= 2).length > top.length ? "; …" : ""}`,
       );
   }
-  if (!cr && !imp) governance();
+  if (!cr && !imp && ctx.subject !== "queue") governance();
   if (cr) {
     add(
       `- Change request: **CR-${cr.id}** "${cr.title}" · ${cr.status.replace("_", " ")} · proposal v${cr.version} · by ${ctx.names([cr.authorId])}${cr.source === "agent" ? " (via MCP)" : ""}`,
@@ -645,6 +677,12 @@ function context(ctx: Ctx, task: Task) {
       );
       if (ctx.fyi.length) add(`- FYI (no approval needed): ${list(ctx.fyi)}`);
     }
+    if (!ctx.queue.length && !ctx.fyi.length && ctx.recent.length)
+      add(
+        `- Recently decided: ${ctx.recent
+          .map((c) => `CR-${c.id} "${c.title}" (${c.status})`)
+          .join("; ")}`,
+      );
   }
   if (
     ctx.subject === "workspace" ||
@@ -734,6 +772,10 @@ export function buildPrompt(
     imp,
     queue,
     fyi: open.filter((c) => c.fyiIds.includes(actor.id)),
+    recent: all
+      .filter((c) => c.status === "published" || c.status === "rejected")
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, 5),
     allOpen: (input.screen || "").toLowerCase() === "changes",
     origin,
     page: input.page?.startsWith(`/w/${svc.ws}`) ? input.page : undefined,

@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   ArrowDown,
-  ArrowUpRight,
   Check,
   ChevronRight,
   CircleHelp,

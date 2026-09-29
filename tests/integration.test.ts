@@ -12,7 +12,6 @@ import {
   hash,
   validPath,
 } from "../server/repository.js";
-import { KnowledgeService } from "../server/service.js";
 import { Store } from "../server/store.js";
 import { demoUsers } from "../server/seed.js";
 import { createApp } from "../server/app.js";

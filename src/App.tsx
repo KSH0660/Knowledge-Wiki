@@ -871,6 +871,7 @@ function SearchDialog({ onClose }: { onClose: () => void }) {
       section: string;
       snippet: string;
       startLine: number;
+      line?: number;
     }[]
   >([]);
   const [busy, setBusy] = useState(false);
@@ -911,7 +912,13 @@ function SearchDialog({ onClose }: { onClose: () => void }) {
     ? results
     : data.documents
         .slice(0, 5)
-        .map((d) => ({ ...d, section: "", snippet: d.excerpt, startLine: 1 }));
+        .map((d) => ({
+          ...d,
+          section: "",
+          snippet: d.excerpt,
+          startLine: 1,
+          line: 1,
+        }));
   return (
     <Modal title={`Search ${data.workspace.name}`} onClose={onClose} wide>
       <div className="search-dialog-input">
@@ -944,7 +951,7 @@ function SearchDialog({ onClose }: { onClose: () => void }) {
                   "/documents?path=" +
                   enc(r.path) +
                   "&line=" +
-                  r.startLine,
+                  (r.line || r.startLine),
               );
               onClose();
             }}

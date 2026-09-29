@@ -2,35 +2,45 @@
 
 ## Deployment
 
-One Node.js 24 process serves a React application, a REST API, and a Streamable HTTP MCP endpoint. SQLite stores workflow state, personal settings, and a disposable full-text index. A local checkout synchronizes with a remote Git repository; the remote is authoritative for published Markdown documents, folder metadata, and their history. No Redis, separate search service, vector database, or agent runtime.
+One Node.js process serves the React application, a REST API, and a Streamable HTTP MCP endpoint. SQLite holds all service state: the workspace registry, change requests and reviews, import staging, personal prompt settings, portal-wide instructions, and a disposable full-text index. Each **workspace** has its own Git repository (a local checkout that synchronizes with that workspace's remote). The remote is authoritative for published Markdown documents, folder governance, and their history. No Redis, separate search service, vector database, parser service, or agent runtime.
 
-In demo mode a local bare repository acts as the remote and is initialized with sample knowledge. Production requires an existing remote, an explicit root owner, and trusted reverse-proxy authentication. Demo identities are never accepted in production.
+In demo mode local bare repositories act as remotes and the first workspace is seeded with sample knowledge. Production requires an existing remote for the default workspace, trusted reverse-proxy authentication, and either a remote template for new workspaces or a data directory where the service keeps their bare repositories.
 
 ## Domain
 
-- **Folder**: arbitrary nested path, display name, optional owner, inherited or explicit approval policy (`local` / `cascade`), local AI instructions. Root always has an owner. Stored in `.knowledge/folders.json` in Git.
-- **Document**: UTF-8 Markdown at a validated relative path; title comes from its first heading. Content and versions are in Git. Documents are created through the same approval flow as edits.
-- **Responsibility**: nearest explicitly assigned ancestor owner. `local` requires that person; `cascade` requires distinct explicit owners on the full ancestor chain. The nearest explicit approval policy is inherited. Approval routes are recomputed before publication so policy changes cannot silently bypass an owner.
-- **Change request**: title, rationale, evidence, author, one or more proposed documents, content hashes of original documents, required human reviewers, decisions, comments and status. Draft → in review → changes requested / published. Editing a proposal invalidates earlier approvals. Final human approval publishes automatically after checking the document base versions and remote tip.
-- **Review**: authenticated human decision on the current proposal revision. MCP identities can read context and propose changes, but cannot approve or administer governance.
-- **Personal AI settings**: per-user, per-task customization. Prompt assembly order is portal → ancestor folder instructions → task template → personal customization → current context → one-off instruction.
+- **Workspace**: slug, name, description, creator. Any registered person can create one and becomes the root owner (the root folder's owner). One `KnowledgeService` and one `Repository` per workspace; operations on different workspaces never share a Git lock or history.
+- **Folder**: nested path, display name, optional owner, inherited or explicit approval policy (`local` / `cascade`), AI instructions, optional watchers. Stored in the workspace's `.knowledge/folders.json`.
+- **Responsibility**: the nearest explicitly assigned ancestor owner. `local` requires that owner; `cascade` requires every distinct explicit owner up the chain. Other chain owners (under `local`) and inherited watchers are **FYI**: informed, never required, unable to approve. The author is never FYI on their own proposal. Routes are recomputed until a proposal is decided, so governance changes cannot bypass an owner.
+- **Document**: UTF-8 Markdown at a validated path. Title from front matter or the first heading. On load the service parses a heading **outline** (with section numbers and line ranges) and **provenance** front matter.
+- **Change request**: title, rationale, evidence, author, files (full content or exact `edits` applied to the current text), required approvers, FYI, reviews, comments, status `draft → in_review → changes_requested | rejected | published`. Staged only in SQLite. The last required approval writes the files (and any new folders) and pushes one commit with `Knowledge-Wiki-Change` / `Approved-by` trailers.
+- **Import session**: staging for bootstrap migration or external-document ingest. Directory files are stored verbatim with exclusion rules; normalized documents are rendered with front-matter provenance and per-section `> Source:` lines. The root owner commits once (one commit, `Knowledge-Wiki-Import` trailer) or discards. See [ingest.md](ingest.md).
+- **Personal settings**: per user, global plus per-task customization.
+
+## Prompt assembly
+
+`server/prompt.ts` builds the same Markdown for the web UI's Copy prompt button and the MCP `build_prompt` tool:
+
+1. Portal-wide instructions (admin-editable, stored in SQLite) and the MCP endpoint
+2. Workspace and folder instructions inherited down to the current folder
+3. Task steps specialised to the subject (document, folder, change, import, queue, governance, workspace) with concrete MCP calls
+4. The viewer's global then task-specific preferences
+5. Current context (paths, hashes, provenance, sections, owners, required vs FYI, CR feedback) and a "Start with" block of executable calls
+6. Optional one-off instruction
+
+When no task is given the server chooses it from the screen and the viewer's role, so the web client can prefetch the prompt when a page opens and copy it synchronously on click.
 
 ## Persistence and consistency
 
-Git writes are serialized inside the single process. Each write refreshes from the remote and pushes a commit before exposing success. Failed pushes reset the local checkout to the remote state. Document-level content hashes detect conflicting edits without blocking unrelated updates. Published commits include the CR identifier; startup/refresh reconciliation can recover a pushed publication if the local process died before recording it in SQLite.
+Git writes are serialized per workspace. Each write refreshes from the remote and pushes before success is reported; a failed push resets the checkout. Document hashes detect conflicting edits without blocking unrelated ones. Startup and sync reconcile commits whose SQLite update was interrupted, for both change requests and imports. Schema version 2 adds workspaces, import staging, and a workspace-aware FTS table; a version 1 database is migrated into the default workspace on start.
 
-Folder changes require current responsibility for that folder (or operational admin). Creating a subfolder inherits responsibility and cannot assign an arbitrary owner. Documents and folder paths are validated; reserved paths, traversal, symlinks and non-Markdown files are not exposed.
+## Search and MCP
 
-SQLite uses WAL mode and explicit schema versioning. Workflow data is durable, whereas full-text search rows can be rebuilt from Git. Back up SQLite with its online backup API and back up the remote repository separately.
-
-## Large documents and MCP
-
-Markdown is indexed in overlapping, line-numbered chunks using SQLite FTS5. Search returns bounded snippets with path, revision, and line ranges. Reads require a line offset and bounded limit, and return continuation information. MCP exposes `search_knowledge`, `read_document`, `get_change_request`, `create_change_request`, and `build_prompt`. It executes no model and makes no external AI calls.
+Markdown is indexed per workspace in line-numbered chunks that never cross a heading, so every hit maps to one section. Search tries all terms first, then any term, returns one hit per section with the best-matching line (weighted by term rarity in the document), and stays scoped to a folder subtree when asked. Reads are bounded by section or by line range (≤200 lines, ≤24,000 characters) with continuation cursors. MCP results are compact JSON with raw Markdown in a separate text block. Agents can browse, search, outline, read, propose changes, stage imports and build prompts; they cannot approve, change governance, or commit imports.
 
 ## Web experience
 
-Home, Knowledge browser, document viewer/history, change composer, CR detail/diff/discussion, My Reviews, Folder Governance and Personal AI Settings share a compact light enterprise shell. Search and contextual AI Prompt stay in the top bar. UI speaks about documents, owners, reviews and publishing; Git details belong to operational documentation.
+Workspace list and switcher; per workspace: Home, Knowledge browser, document viewer (provenance, server outline, history), change composer, change detail (diff, discussion, required vs FYI, reject), My reviews (needs approval / FYI / reviewed), Folder governance (owner, policy, watchers, resulting route, AI instructions), import review (staged tree, rendered and source preview, skipped files, suggestions, commit/discard), and AI prompt settings. Every page carries the 1-click Copy prompt button; customization is a secondary drawer.
 
 ## Verification
 
-Integration tests use a real temporary bare Git remote and SQLite database. They cover owner/policy inheritance, cascading approvals, non-owner and agent denial, stale document conflicts, failed remote pushes, prompt order, partial reads, workflow persistence and protocol calls. Browser checks cover navigation, creation/review/publishing, prompt copying, settings persistence and narrow layouts.
+Integration tests use real temporary bare Git remotes and SQLite databases. End-to-end verification with two public specifications is recorded in [verification.md](verification.md).

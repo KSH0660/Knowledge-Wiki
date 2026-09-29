@@ -112,7 +112,7 @@ export async function handleMcp(
   );
   tool(
     "search_knowledge",
-    "Full-text search. Returns the matching section heading, line range and a short snippet per hit (one hit per section). If no result contains every term, results matching any term are returned with matched='any'.",
+    "Full-text search. Returns per hit (one per section): the section heading, the best-matching line, the chunk's line range and a short snippet. Read around `line` (e.g. start_line=line-5, limit=30) or the whole `section`. If no result contains every term, results matching any term are returned with matched='any'.",
     {
       workspace,
       query: z.string().min(1).max(200),
@@ -131,6 +131,7 @@ export async function handleMcp(
         results: s.search(query, folder, limit).map((r) => ({
           path: r.path,
           section: r.section || r.title,
+          line: r.line,
           lines: [r.startLine, r.endLine],
           snippet: r.snippet,
           ...(r.matched === "any" ? { matched: "any" } : {}),
@@ -251,13 +252,11 @@ export async function handleMcp(
             version: r.version,
             comment: r.comment.slice(0, 1000),
           })),
-        comments: cr.comments
-          .slice(-10)
-          .map((c) => ({
-            user: c.userId,
-            text: c.text.slice(0, 1000),
-            at: c.at,
-          })),
+        comments: cr.comments.slice(-10).map((c) => ({
+          user: c.userId,
+          text: c.text.slice(0, 1000),
+          at: c.at,
+        })),
         files: cr.files.map((f) => ({
           path: f.path,
           baseHash: f.baseHash,
@@ -385,7 +384,7 @@ export async function handleMcp(
   );
   tool(
     "stage_normalized_documents",
-    "External document ingest (PDF etc., analyzed by you outside Knowledge Wiki). Each document = path (relative to target_folder, .md), title, optional source_section/pages/summary, and sections[] {number, title, level 2–6, pages [first,last] as 1-based PDF pages, content (Markdown body without the heading)}. The server writes front-matter provenance and a '> Source:' line per section. append=true adds sections to an already staged document. ≤40 documents and ≤4 MB per call.",
+    "External document ingest (PDF etc., analyzed by you outside Knowledge Wiki). Each document = path (relative to target_folder, .md), title, optional source_section/pages/summary/intro, and sections[] {number, title, level 2–6, pages [first,last] as 1-based PDF pages, content (Markdown body without the heading)}. The server writes front-matter provenance and a '> Source:' line per section. append=true adds sections to an already staged document. ≤40 documents and ≤4 MB per call.",
     {
       import_id: z.number().int().positive(),
       workspace,
@@ -409,6 +408,11 @@ export async function handleMcp(
             source_section: z.string().max(60).optional(),
             pages: z.array(z.number().int().positive()).max(2).optional(),
             summary: z.string().max(2000).optional(),
+            intro: z
+              .string()
+              .max(1_000_000)
+              .optional()
+              .describe("Markdown that precedes the first section"),
             append: z.boolean().optional(),
             sections: z
               .array(
@@ -420,8 +424,8 @@ export async function handleMcp(
                   content: z.string().max(1_000_000),
                 }),
               )
-              .min(1)
-              .max(400),
+              .max(400)
+              .default([]),
           }),
         )
         .min(1)

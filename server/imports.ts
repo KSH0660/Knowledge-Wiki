@@ -50,6 +50,8 @@ export interface NormalizedDocument {
   source_section?: string;
   pages?: number[];
   summary?: string;
+  /** Markdown body that precedes the first section (the section's own lead text). */
+  intro?: string;
   append?: boolean;
   sections: NormalizedSection[];
 }
@@ -271,7 +273,8 @@ export class Imports {
     const heading =
       s.number && !title.startsWith(s.number) ? `${s.number} ${title}` : title;
     const [first, last] = [s.pages?.[0], s.pages?.at(-1)];
-    const provenance = [s.number ? `§${s.number}` : "", pageText(first, last)]
+    const pages = pageText(first, last);
+    const provenance = [s.number ? `§${s.number}` : "", pages && `PDF ${pages}`]
       .filter(Boolean)
       .join(", ");
     return (
@@ -296,7 +299,10 @@ export class Imports {
       input.documents.length,
       40,
       input.documents.reduce(
-        (n, d) => n + d.sections.reduce((m, s) => m + bytes(s.content), 0),
+        (n, d) =>
+          n +
+          bytes(d.intro || "") +
+          d.sections.reduce((m, s) => m + bytes(s.content), 0),
         0,
       ),
     );
@@ -336,10 +342,10 @@ export class Imports {
           });
           continue;
         }
-        if (!d.sections.length || !d.title.trim()) {
+        if ((!d.sections.length && !d.intro?.trim()) || !d.title.trim()) {
           skipped.push({
             path: d.path,
-            reason: "a title and at least one section are required",
+            reason: "a title and an intro or at least one section are required",
           });
           continue;
         }
@@ -354,8 +360,11 @@ export class Imports {
           ...d.sections.flatMap((s) => s.pages || []),
         ].filter((n) => Number.isInteger(n) && n > 0);
         const body =
-          (prior ? previous!.content : "") +
-          d.sections.map((s) => this.section(s)).join("");
+          (prior
+            ? previous!.content
+            : d.intro?.trim()
+              ? d.intro.trim() + "\n\n"
+              : "") + d.sections.map((s) => this.section(s)).join("");
         if (body.length > 2_000_000) {
           skipped.push({
             path: d.path,
@@ -412,7 +421,10 @@ export class Imports {
   files(id: number, offset = 0, limit = 200, folder = "") {
     const all = this.store
       .stagedFiles(id)
-      .filter((f) => !folder || f.path.startsWith(folder + "/"));
+      .filter((f) => !folder || f.path.startsWith(folder + "/"))
+      .sort((a, b) =>
+        a.path.localeCompare(b.path, undefined, { numeric: true }),
+      );
     return {
       total: all.length,
       offset,

@@ -300,6 +300,21 @@ const headingId = (value: ReactNode) =>
   String(value)
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-");
+type MdNode = { type: string; value?: string; children?: MdNode[] };
+/**
+ * GFM table cells can only express line breaks as `<br>`. Turn exactly that tag into a
+ * Markdown break; every other raw HTML stays inert (no HTML rendering, no XSS surface).
+ */
+function remarkLineBreaks() {
+  const walk = (node: MdNode) => {
+    node.children?.forEach((child, i) => {
+      if (child.type === "html" && /^<br\s*\/?>$/i.test(child.value || ""))
+        node.children![i] = { type: "break" };
+      else walk(child);
+    });
+  };
+  return (tree: MdNode) => walk(tree);
+}
 export function Markdown({
   content,
   compact = false,
@@ -310,7 +325,7 @@ export function Markdown({
   return (
     <div className={"markdown " + (compact ? "compact" : "")}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkLineBreaks]}
         components={{
           h2: ({ children }) => <h2 id={headingId(children)}>{children}</h2>,
           a: ({ href, children }) => (

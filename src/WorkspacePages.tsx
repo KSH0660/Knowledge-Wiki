@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import {
   ArrowUpRight,
   Check,
@@ -242,7 +242,6 @@ type ImportDetail = ImportSession & { files: ImportFileSummary[] };
 export function ImportPage() {
   const { id } = useParams();
   const { data, base, refresh, notify } = useApp();
-  const navigate = useNavigate();
   const [session, setSession] = useState<ImportDetail | null>(null);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState("");
@@ -293,7 +292,9 @@ export function ImportPage() {
   }, [selected, session?.status]);
   const groups = useMemo(() => {
     const map = new Map<string, ImportFileSummary[]>();
-    for (const f of session?.files || []) {
+    const byPath = (a: ImportFileSummary, b: ImportFileSummary) =>
+      a.path.localeCompare(b.path, undefined, { numeric: true });
+    for (const f of [...(session?.files || [])].sort(byPath)) {
       const folder = f.path.includes("/")
         ? f.path.slice(0, f.path.lastIndexOf("/"))
         : "";

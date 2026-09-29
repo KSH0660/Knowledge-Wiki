@@ -187,7 +187,13 @@ export class KnowledgeService {
   }
   private current(cr: ChangeRequest): ChangeRequest {
     if (cr.status === "published" || cr.status === "rejected") return cr;
-    return { ...cr, ...this.route(cr.files.map((f) => f.path)) };
+    const route = this.route(cr.files.map((f) => f.path));
+    // An author is never "informed" about their own proposal.
+    return {
+      ...cr,
+      ...route,
+      fyiIds: route.fyiIds.filter((id) => id !== cr.authorId),
+    };
   }
   approvedBy(cr: ChangeRequest, id: string) {
     return cr.reviews.some(
@@ -330,6 +336,7 @@ export class KnowledgeService {
       matched = "any";
     }
     const seen = new Set<string>();
+    const prepared = new Map<string, string[] | undefined>();
     return rows
       .filter((r) => {
         const k = r.path + "\0" + r.section;
@@ -338,12 +345,51 @@ export class KnowledgeService {
         return true;
       })
       .slice(0, limit)
-      .map((r) => ({
-        ...r,
-        startLine: Number(r.startLine),
-        endLine: Number(r.endLine),
-        matched,
-      }));
+      .map((r) => {
+        const startLine = Number(r.startLine);
+        const endLine = Number(r.endLine);
+        return {
+          ...r,
+          startLine,
+          endLine,
+          line:
+            this.hitLine(r.path, startLine, endLine, words, prepared) ??
+            startLine,
+          matched,
+        };
+      });
+  }
+  /** Best-matching line in a chunk; terms rare in the whole document weigh more. */
+  private hitLine(
+    p: string,
+    from: number,
+    to: number,
+    words: string[],
+    prepared: Map<string, string[] | undefined>,
+  ) {
+    // Prepare each document once per search, however many sections it hits.
+    if (!prepared.has(p))
+      prepared.set(p, this.repo.docs.get(p)?.content.toLowerCase().split("\n"));
+    const all = prepared.get(p);
+    if (!all) return undefined;
+    const terms = words.map((w) => w.toLowerCase());
+    const weight = terms.map((t) => {
+      const df = all.reduce((n, l) => n + (l.includes(t) ? 1 : 0), 0);
+      return Math.log(1 + all.length / Math.max(1, df));
+    });
+    let best: number | undefined;
+    let score = 0;
+    for (let i = from - 1; i < Math.min(to, all.length); i++) {
+      const n = terms.reduce(
+        (sum, t, k) => sum + (all[i].includes(t) ? weight[k] : 0),
+        0,
+      );
+      if (n > score) {
+        score = n;
+        best = i + 1;
+      }
+    }
+    return best;
   }
   doc(p: string) {
     validPath(p, true);
@@ -699,6 +745,9 @@ export class KnowledgeService {
         status: input.draft ? ("draft" as const) : ("in_review" as const),
         files,
         ...this.route(files.map((f) => f.path)),
+        fyiIds: this.route(files.map((f) => f.path)).fyiIds.filter(
+          (id) => id !== actor.id,
+        ),
         reviews: [],
         reviewHistory: [
           ...(existing?.reviewHistory || []),
