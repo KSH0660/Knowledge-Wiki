@@ -1,0 +1,10 @@
+node_modules
+dist
+.data
+.git
+.env
+ui_samples
+output
+.playwright-cli
+backups
+.DS_Store

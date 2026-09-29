@@ -1,0 +1,11 @@
+[
+  {
+    "id": "sunho",
+    "name": "Sunho Kim",
+    "initials": "SK",
+    "color": "#3867db",
+    "admin": true
+  },
+  { "id": "alex", "name": "Alex Jung", "initials": "AJ", "color": "#8c5ed5" },
+  { "id": "yuna", "name": "Yuna Kim", "initials": "YK", "color": "#188477" }
+]
